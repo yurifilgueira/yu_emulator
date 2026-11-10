@@ -24,17 +24,22 @@ them pass and are recorded in `DEVLOG.md`.
 - [x] `harness run <bios> --cycles N` with an instruction trace option
 - [x] Hook BIOS `putchar` (B-function 0x3D) and print TTY output
 - **Accept:** the BIOS prints its boot text on the terminal ✅ (OpenBIOS,
-  2026-11-09); amidog's CPU tests pass once Phase 2 can load them (open —
-  carried into Phase 2's acceptance).
+  2026-11-09); amidog's CPU tests pass once Phase 2 can load them (open:
+  Phase 2 loads them, but they report on screen only — carried to Phase 3).
 
-## Phase 2 — Sideload, interrupts, timers, DMA
+## Phase 2 — Sideload, interrupts, timers, DMA ✅ (amidog pending Phase 3)
 
-- [ ] Load PS-EXE files directly into RAM (skip the CD)
-- [ ] Interrupt controller (I_STAT / I_MASK)
-- [ ] Timers 0-2
-- [ ] DMA: channel 6 (OTC) and channel 2 (GPU, linked list and block)
-- [ ] `harness exe <bios> <file.exe>`
+- [x] Load PS-EXE files directly into RAM (skip the CD)
+- [x] Interrupt controller (I_STAT / I_MASK)
+- [x] Timers 0-2
+- [x] DMA: channel 6 (OTC) and channel 2 (GPU, linked list and block)
+- [x] `harness exe <bios> <file.exe>` (plus `harness suite <bios> <dir>`)
 - **Accept:** CPU test programs from `tests/` run and report pass.
+  ps1-tests `cpu/cop` (17/17) and `cpu/code-in-io` (7/7) pass against
+  their console logs, as does `dma/otc-test` (2026-11-09, OpenBIOS).
+  Still open: amidog's `psxtest_cpu` / `psxtest_cpx` only show their
+  results on screen and wait on GPUSTAT, so they need the Phase 3 GPU;
+  ps1-tests `cpu/access-time` needs cycle-accurate memory timing (Phase 8).
 
 ## Phase 3 — GPU
 
@@ -44,7 +49,8 @@ them pass and are recorded in `DEVLOG.md`.
 - [ ] `frontend` crate with a window showing VRAM / display area
 - [ ] `harness vram-hash` compares output against reference images
 - **Accept:** BIOS shell (memory card / CD player menu) renders; GPU test
-  programs match their reference images.
+  programs match their reference images; amidog's `psxtest_cpu` and
+  `psxtest_cpx` show all tests passing (carried over from Phases 1-2).
 
 ## Phase 4 — GTE
 

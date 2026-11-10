@@ -17,6 +17,97 @@ Model: claude-fable-5-2 · Session time: Xh · Human interventions: N
 
 ---
 
+## 2026-11-09 — Phase 2: PS-EXE sideload, interrupts, timers, DMA
+
+Model: claude-fable-5-2 · Session time: ~1.5h (estimate, not measured) · Human interventions: 0
+
+- Done:
+  - New core modules: `irq` (I_STAT/I_MASK), `timers` (clock sources, sync
+    modes, one-shot/repeat/toggle IRQs), `dma` (registers, DPCR, DICR flag
+    logic), `video` (hblank/vblank/dot clock generator standing in for the
+    GPU), `exe` (PS-EXE parser). The bus routes the registers and runs the
+    transfers: OTC, GPU block/slice, GPU linked list one node per tick.
+  - `Psx::run_to_shell` + `Psx::sideload`: boot the real BIOS until it jumps
+    to 0x80030000, then start the PS-EXE instead of the shell.
+  - Harness: `exe <bios> <file.exe> [--expect psx.log]`, `suite <bios> <dir>`
+    and `--trace-from CYCLE`.
+  - Test programs downloaded by me into gitignored folders: the ps1-tests
+    release (build-158) into `tests/ps1-tests/`, amidog's `psxtest_cpu` and
+    `psxtest_cpx` into `tests/amidog/`. Not committed.
+  - 109 unit tests (106 core, 3 harness).
+- Results (`harness suite bios/openbios.bin tests/ps1-tests`): 3 of 21 pass.
+  - PASS `cpu/cop` 17/17, `cpu/code-in-io` 7/7, `dma/otc-test` 13/13 (its 2
+    newer cases, missing from the 2021 log, also print pass).
+  - `timers`: for 1000/5000-cycle delays the "System clock" rows (1011,
+    5011) and the "Hblank" rows equal the console log, apart from one
+    6737 outlier in the log; the "/8" rows show the same 126/127 and
+    626/627 values in a different order; frame delays are within 0.4%.
+    Dot clock rows and the sync-mode tables differ (see below). Compared
+    as text it is a FAIL.
+  - `dma/chain-looping`: the finished/irq flags match the console for all
+    four cases; the tick counts do not (7008 vs 16040).
+  - Everything else needs GPU, GTE, CD-ROM, SPU or MDEC.
+- Not done / still open:
+  - **amidog's CPU tests do not report.** They print "args: 0", then poll
+    GPUSTAT forever and would show their results on screen only. This is
+    the criterion carried over from Phase 1; it now moves to Phase 3. So no
+    independent CPU test suite beyond ps1-tests' 24 assertions has judged
+    the interpreter yet.
+  - `cpu/access-time` prints `1.%  .d` instead of numbers: its printf
+    format is not understood by OpenBIOS's printf. Even with a Sony BIOS it
+    would not match, since every instruction costs one cycle here.
+- Broke / surprised us:
+  - **psx-spx is wrong, or incomplete, about coprocessors.** My Phase 1 code
+    followed it and failed several `cpu/cop` tests on the first run. On a
+    real console COP1/COP3 instructions and LWCn/SWCn raise "coprocessor
+    unusable" only while the CU bit is clear (for COP0 even in kernel mode)
+    and are otherwise ignored, and an unknown COP0 command raises nothing.
+    The Phase 1 unit tests had encoded the psx-spx reading, so they passed
+    while the behaviour was wrong: tests written from the same document as
+    the code cannot catch a mistake in the document.
+  - I had also misjudged Phase 1's "next" note: the SPUSTAT wait is in the
+    BIOS *shell*, which sideloading skips, so it did not block Phase 2.
+  - Three of my own tests were wrong, not the code: an off-by-one in the
+    expected dot count for a frame, and two that assumed 178 CPU cycles are
+    280 video cycles (it is 279.7). Fixed by using exact multiples.
+  - The first `--expect` compared whole logs and stopped once the output was
+    as long as the reference, which cut programs off mid-line and failed on
+    harmless differences ("% " prefixes, library `ResetGraph:` lines, tests
+    added after the log was captured). Replaced by per-test judging for
+    pass/fail logs and text comparison for the rest.
+  - `code-in-io` executes code written into SPU registers. The I/O stub
+    read zeros there, so the CPU ran off through I/O space; it needed
+    registers that remember their value.
+  - The timers log shows 198 dot-clock ticks per 1011 cycles (a /8 dot
+    clock, 320 pixels); I get 159 (/10). The released binary writes
+    GP1(08h)=0 (256 pixels) before measuring — I logged its GP1 writes —
+    so the binary and the log seem to be from different versions. Not
+    resolved; I did not change the emulator to match the log.
+  - A 20M-line trace piped through sort took minutes and told me nothing;
+    `--trace-from` exists because of that.
+- How it was found and fixed: all of the above came from running the
+  console-verified programs and reading their sources and logs, not from
+  unit tests. Each hardware-derived deviation from psx-spx is commented at
+  the code with the test that shows it.
+- Human stepped in for: nothing this session.
+- Known gaps and deviations (commented in the code):
+  - Timing is still one cycle per instruction. DMA charges 1 cycle/word.
+  - Timer details from psx-spx "Reset and Wrap" (1-2 cycle holds) and the
+    INTF pulse are not modelled; DMA chopping and DICR per-block interrupts
+    are ignored.
+  - Hblank/vblank positions are derived from the default display range;
+    only the dot clock follows GP1(08h). This is why the timer sync-mode
+    tables differ. The GPU (Phase 3) must own this.
+  - Stubs that return plausible values so software proceeds, all still
+    listed as unhandled by the harness: GPUSTAT reads 0x14802000, SPU
+    registers are plain memory with STATX mirroring ATTR bits 0-5,
+    expansion 2/3 read all ones.
+  - Narrow stores to the middle of a 32-bit I/O register: psx-spx is
+    silent; only the addressed bytes are written.
+  - DMA to devices that do not exist yet stays pending forever.
+- Next: Phase 3, the GPU. First milestone inside it: enough GPUSTAT and GP0
+  for amidog's two programs to draw their result screens, then read those.
+
 ## 2026-11-09 — Phase 1: R3000A CPU, BIOS boots to its TTY banner
 
 Model: claude-fable-5-2 · Session time: ~1h (estimate, not measured) · Human interventions: 3
