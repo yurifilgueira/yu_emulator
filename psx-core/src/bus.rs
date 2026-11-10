@@ -20,6 +20,7 @@ use crate::dma::{self, Dma, SyncMode};
 use crate::gpu::Gpu;
 use crate::irq::{Interrupt, Irq};
 use crate::map::{self, mask_region};
+use crate::spu::Spu;
 use crate::timers::Timers;
 use std::collections::HashSet;
 use std::fmt;
@@ -116,8 +117,7 @@ pub struct Bus {
     dma_list_active: bool,
     /// CPU cycles consumed by DMA transfers since the last `take_stall`.
     stall: u32,
-    /// SPU stub (Phase 7): the register file as plain memory.
-    spu_regs: Box<[u8]>,
+    pub spu: Spu,
     /// Distinct unhandled accesses, in first-seen order.
     unhandled: Vec<UnhandledAccess>,
     unhandled_seen: HashSet<UnhandledAccess>,
@@ -146,7 +146,7 @@ impl Bus {
             gpu: Gpu::new(),
             dma_list_active: false,
             stall: 0,
-            spu_regs: vec![0; map::SPU.length as usize].into_boxed_slice(),
+            spu: Spu::default(),
             unhandled: Vec::new(),
             unhandled_seen: HashSet::new(),
         })
@@ -318,10 +318,13 @@ impl Bus {
             0x1F80_1810 => self.gpu.read(),
             0x1F80_1814 => self.gpu.status(),
             _ => {
-                self.record(Region::Io, AccessKind::Load, width, addr);
                 if let Some(off) = map::SPU.contains(addr) {
-                    return self.spu_load(off, width);
+                    if !Spu::is_implemented(off) {
+                        self.record(Region::Io, AccessKind::Load, width, addr);
+                    }
+                    return self.spu.load(off, width);
                 }
+                self.record(Region::Io, AccessKind::Load, width, addr);
                 // Expansion 2 with nothing attached is open bus and reads
                 // all ones, like expansion 1 (hardware log of ps1-tests
                 // cpu/io-access-bitwidth: EXPANSION2 reads FFh).
@@ -370,44 +373,19 @@ impl Bus {
             0x1F80_1810 => self.gp0(value),
             0x1F80_1814 => self.gpu.gp1(value),
             _ => {
-                self.record(Region::Io, AccessKind::Store, width, addr);
                 if let Some(off) = map::SPU.contains(addr) {
-                    self.spu_store(off, width, val);
+                    if !Spu::is_implemented(off) {
+                        self.record(Region::Io, AccessKind::Store, width, addr);
+                    }
+                    self.spu.store(off, width, val);
+                    // Selecting a DMA transfer mode raises the SPU's data
+                    // request, which may start a waiting DMA4 transfer.
+                    self.dma_start_ready_channels();
+                    return;
                 }
+                self.record(Region::Io, AccessKind::Store, width, addr);
             }
         }
-    }
-
-    // SPU stub (Phase 7). psx-spx: "SPU I/O Port Summary". The registers
-    // only remember what was written, which is enough for software that
-    // configures the SPU and reads its settings back; no sound is produced
-    // and no SPU RAM transfer or interrupt ever happens.
-
-    /// psx-spx: "0x1f801dae: STATX".
-    const SPU_STATX: usize = 0x1AE;
-    /// psx-spx: "0x1f801daa: ATTR".
-    const SPU_ATTR: usize = 0x1AA;
-
-    fn spu_load(&mut self, off: u32, width: Width) -> u32 {
-        let off = off as usize;
-        // STATX bits 5-0: "Current SPU Mode (same as ATTR.Bit5-0, but,
-        // applied a bit delayed)". Applied at once here. Software waits for
-        // this after every ATTR write. All other status bits read zero.
-        let mode = self.spu_regs[Self::SPU_ATTR] & 0x3F;
-        self.spu_regs[Self::SPU_STATX] = mode;
-        self.spu_regs[Self::SPU_STATX + 1] = 0;
-        read_le(&self.spu_regs, off, width)
-    }
-
-    fn spu_store(&mut self, off: u32, width: Width, val: u32) {
-        // The registers are 16 bits wide and a byte store writes the whole
-        // halfword (hardware log of ps1-tests cpu/io-access-bitwidth: an
-        // 8-bit store of 12345678h to SPUCNT reads back 5678h).
-        let (off, width) = match width {
-            Width::Byte => (off as usize & !1, Width::Half),
-            _ => (off as usize, width),
-        };
-        write_le(&mut self.spu_regs, off, width, val);
     }
 
     /// Sends a word to GP0 and forwards a GP0(1Fh) interrupt request.
@@ -439,8 +417,13 @@ impl Bus {
             // DREQ: the OTC channel has none, so it only starts when forced.
             // The GPU executes commands instantly, so it is always ready
             // for data (deviation: GP1(04h) "DMA Direction" is not checked).
+            // The SPU requests data while a DMA transfer mode is selected.
             // No other device exists yet.
-            let dreq = n == dma::CHANNEL_GPU;
+            let dreq = match n {
+                dma::CHANNEL_GPU => true,
+                dma::CHANNEL_SPU => self.spu.dma_request(),
+                _ => false,
+            };
             if !(channel.forced() || dreq) {
                 continue;
             }
@@ -452,7 +435,7 @@ impl Bus {
                         self.dma_list_active = true;
                     }
                 }
-                (dma::CHANNEL_GPU, SyncMode::Burst | SyncMode::Slice) => self.dma_gpu_block(),
+                (dma::CHANNEL_GPU | dma::CHANNEL_SPU, SyncMode::Burst | SyncMode::Slice) => self.dma_block(n),
                 // Device not implemented (or reserved sync mode): the
                 // transfer stays pending, as if DREQ never came.
                 _ => self.record(Region::Io, AccessKind::Store, Width::Word, 0x1F80_1088 + 0x10 * n as u32),
@@ -509,9 +492,9 @@ impl Bus {
         self.dma.complete(n, &mut self.irq);
     }
 
-    /// DMA2 in burst or slice mode: image data to/from the GPU.
-    fn dma_gpu_block(&mut self) {
-        let n = dma::CHANNEL_GPU;
+    /// Burst or slice transfer between RAM and a device: image data to/from
+    /// the GPU (DMA2) or sound RAM data to/from the SPU (DMA4).
+    fn dma_block(&mut self, n: usize) {
         self.dma.begin(n);
         let channel = self.dma.channels[n];
         let slice = channel.sync_mode() == SyncMode::Slice;
@@ -524,13 +507,14 @@ impl Bus {
         let mut in_ram = true;
         for _ in 0..words {
             if channel.chcr & dma::CHCR_FROM_RAM != 0 {
-                match self.dma_read(addr) {
-                    Some(word) => self.gp0(word),
-                    None => in_ram = false,
+                match (self.dma_read(addr), n) {
+                    (Some(word), dma::CHANNEL_GPU) => self.gp0(word),
+                    (Some(word), _) => self.spu.dma_write(word),
+                    (None, _) => in_ram = false,
                 }
             } else {
                 // "DMA2 is equivalent to accessing Port 1F801810h".
-                let word = self.gpu.read();
+                let word = if n == dma::CHANNEL_GPU { self.gpu.read() } else { self.spu.dma_read() };
                 in_ram &= self.dma_write(addr, word);
             }
             addr = addr.wrapping_add(channel.step()) & 0x00FF_FFFC;
@@ -541,7 +525,8 @@ impl Bus {
             self.dma.channels[n].madr = addr;
             self.dma.channels[n].bcr &= 0xFFFF;
         }
-        self.stall += words;
+        // psx-spx: "DMA Transfer Rates" — GPU 1 clk/word, SPU 4 clks/word.
+        self.stall += words * if n == dma::CHANNEL_SPU { 4 } else { 1 };
         if !in_ram {
             self.dma.bus_error(&mut self.irq);
         }
@@ -955,21 +940,34 @@ mod tests {
     // ---- stubs for later phases ------------------------------------------
 
     #[test]
-    fn spu_registers_remember_writes_and_status_mirrors_mode() {
+    fn spu_registers_are_reachable_and_unimplemented_ones_reported() {
         let mut b = bus();
-        b.store16(0x1F80_1C00, 0x1234).unwrap();
-        b.store16(0x1F80_1C02, 0x5678).unwrap();
-        assert_eq!(b.load32(0x1F80_1C00).unwrap(), 0x5678_1234);
-        // A byte store writes the whole 16-bit register.
-        b.store(0x1F80_1DAA, Width::Byte, 0x1234_5678).unwrap();
-        assert_eq!(b.load16(0x1F80_1DAA).unwrap(), 0x5678);
-        // psx-spx: STATX bits 5-0 follow ATTR bits 5-0.
-        b.store16(0x1F80_1DAA, 0xC0A5).unwrap();
-        assert_eq!(b.load16(0x1F80_1DAE).unwrap(), 0x0025);
-        b.store16(0x1F80_1DAE, 0xFFFF).unwrap();
-        assert_eq!(b.load16(0x1F80_1DAE).unwrap(), 0x0025, "status is read-only");
-        // Still reported as unimplemented hardware.
-        assert!(b.unhandled().iter().any(|a| a.addr == 0x1F80_1DAA));
+        b.store16(0x1F80_1C00, 0x1234).unwrap(); // voice 0 volume: no voices yet
+        assert_eq!(b.load16(0x1F80_1C00).unwrap(), 0x1234);
+        assert!(b.unhandled().iter().any(|a| a.addr == 0x1F80_1C00));
+        // The transfer registers are implemented and not reported.
+        b.store(0x1F80_1DAA, Width::Byte, 0x1234_5625).unwrap();
+        assert_eq!(b.load16(0x1F80_1DAA).unwrap(), 0x5625);
+        assert_eq!(b.load16(0x1F80_1DAE).unwrap() & 0x3F, 0x25);
+        assert!(!b.unhandled().iter().any(|a| a.addr == 0x1F80_1DAA || a.addr == 0x1F80_1DAE));
+    }
+
+    #[test]
+    fn dma4_uploads_to_sound_ram_once_the_spu_requests_data() {
+        // psx-spx: "SPU RAM DMA-Write".
+        let mut b = bus();
+        b.store32(0x6000, 0x4433_2211).unwrap();
+        b.store32(0x6004, 0x8877_6655).unwrap();
+        b.store32(DPCR, 0x076D_4321).unwrap(); // enable channel 4
+        b.store16(0x1F80_1DA6, 0x0002).unwrap(); // sound RAM address 0x10
+        b.store32(0x1F80_10C0, 0x6000).unwrap();
+        b.store32(0x1F80_10C4, (2 << 16) | 1).unwrap(); // 2 blocks of 1 word
+        b.store32(0x1F80_10C8, 0x0100_0201).unwrap();
+        assert_ne!(b.load32(0x1F80_10C8).unwrap() & (1 << 24), 0, "waits: SPU transfer mode is Stop");
+        b.store16(0x1F80_1DAA, 0x0020).unwrap(); // DMA write
+        assert_eq!(b.load32(0x1F80_10C8).unwrap() & (1 << 24), 0, "completed");
+        assert_eq!(&b.spu.ram()[0x10..0x18], &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+        assert_eq!(b.take_stall(), 8, "4 clks per word");
     }
 
     #[test]

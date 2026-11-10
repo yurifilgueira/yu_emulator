@@ -144,6 +144,22 @@ impl Video {
         (self.frame & 1) as u32
     }
 
+    /// The interlace field the display is working on: the one being scanned
+    /// out, or, once vblank has started at the bottom of the picture, the
+    /// one that will be scanned out next.
+    ///
+    /// Not in psx-spx. It is what interlaced drawing must be relative to:
+    /// software that draws during vblank (or that paces itself on GPUSTAT
+    /// bit 31, as the OpenBIOS shell does) would otherwise draw the same
+    /// field twice and never the other one.
+    pub fn display_field(&self) -> u32 {
+        if self.line >= self.y2 {
+            self.field() ^ 1
+        } else {
+            self.field()
+        }
+    }
+
     /// Frames completed since power-on.
     pub fn frame(&self) -> u64 {
         self.frame
@@ -280,6 +296,18 @@ mod tests {
         assert!(e.in_vblank);
         assert!(e.vblank_started);
         assert_eq!(video.line(), 0x100);
+    }
+
+    #[test]
+    fn display_field_switches_when_vblank_starts() {
+        let mut video = Video::default();
+        assert_eq!((video.field(), video.display_field()), (0, 0));
+        video.tick(cpu_cycles(0x100 * NTSC_CYCLES_PER_LINE));
+        assert_eq!(video.line(), 0x100);
+        assert_eq!((video.field(), video.display_field()), (0, 1), "bottom vblank: next field");
+        video.tick(cpu_cycles(7 * NTSC_CYCLES_PER_LINE));
+        assert_eq!(video.line(), 0);
+        assert_eq!((video.field(), video.display_field()), (1, 1), "after vsync both agree");
     }
 
     #[test]

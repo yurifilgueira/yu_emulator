@@ -496,11 +496,16 @@ impl Gpu {
         let pixel = rgb24_to_15(color);
         // "Fill does NOT occur when Xsiz=0 or Ysiz=0"; "Rectangle filling is
         // not affected by the GP0(E6h) mask setting".
-        // Deviation: in interlaced modes other emulators skip the lines of
-        // the displayed field here as well; psx-spx does not mention it and
-        // it is not done.
         for row in 0..height {
             let y = (y0 + row) % VRAM_HEIGHT;
+            // psx-spx: "the Vertical Interlace flag DOES affect GP0 draw
+            // commands". The fill follows the same rule as the primitives:
+            // otherwise a program that clears and redraws every field (the
+            // OpenBIOS shell does) would erase the field on screen and only
+            // ever redraw the other one.
+            if self.skip_line(y as i32) {
+                continue;
+            }
             for col in 0..width {
                 let x = (x0 + col) % VRAM_WIDTH;
                 self.vram[y * VRAM_WIDTH + x] = pixel;

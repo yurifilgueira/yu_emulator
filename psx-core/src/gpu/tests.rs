@@ -658,6 +658,34 @@ fn gouraud_polyline_terminator_is_on_the_colour_word() {
     assert_eq!(pixel(&gpu, 3, 0), RED);
 }
 
+// ---- interlace -------------------------------------------------------------
+
+#[test]
+fn interlaced_drawing_skips_the_displayed_field() {
+    // psx-spx: "GP1(08h)": "the Vertical Interlace flag DOES affect GP0 draw
+    // commands". In 480-line interlaced mode only the lines of the field
+    // that is not being displayed are drawn, for fills and primitives alike.
+    let mut gpu = gpu();
+    gpu.gp1(0x0800_0024); // 480 lines, interlaced
+    assert_eq!(gpu.video.field(), 0);
+    send(&mut gpu, &[0x02FF_FFFF, xy(0, 0), (4 << 16) | 16]);
+    send(&mut gpu, &[0x6000_00FF, xy(32, 0), (4 << 16) | 4]);
+    // Field 0 with display start 0 shows even lines: only odd ones change.
+    assert_eq!([pixel(&gpu, 0, 0), pixel(&gpu, 0, 1), pixel(&gpu, 0, 2), pixel(&gpu, 0, 3)], [0, WHITE, 0, WHITE]);
+    assert_eq!([pixel(&gpu, 32, 0), pixel(&gpu, 32, 1), pixel(&gpu, 32, 2), pixel(&gpu, 32, 3)], [0, RED, 0, RED]);
+
+    // GP0(E1h).10 "Drawing to display area ... 1=Allowed" lifts that.
+    gpu.gp0(0xE100_0400);
+    send(&mut gpu, &[0x6000_00FF, xy(64, 0), (2 << 16) | 1]);
+    assert_eq!([pixel(&gpu, 64, 0), pixel(&gpu, 64, 1)], [RED, RED]);
+
+    // Without interlace every line is drawn.
+    gpu.gp0(0xE100_0000);
+    gpu.gp1(0x0800_0000);
+    send(&mut gpu, &[0x6000_00FF, xy(96, 0), (2 << 16) | 1]);
+    assert_eq!([pixel(&gpu, 96, 0), pixel(&gpu, 96, 1)], [RED, RED]);
+}
+
 // ---- display ---------------------------------------------------------------
 
 #[test]

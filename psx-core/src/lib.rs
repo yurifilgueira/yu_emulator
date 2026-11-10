@@ -12,6 +12,7 @@ pub mod exe;
 pub mod gpu;
 pub mod irq;
 pub mod map;
+pub mod spu;
 pub mod system;
 pub mod timers;
 pub mod video;

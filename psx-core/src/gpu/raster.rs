@@ -201,13 +201,13 @@ impl Gpu {
     /// psx-spx: "GP1(08h)": "the Vertical Interlace flag DOES affect GP0
     /// draw commands". psx-spx does not say how. As commonly emulated: in
     /// 480-line interlaced mode, unless drawing to the display area is
-    /// allowed (GP0(E1h).10), lines of the field being displayed are not
-    /// drawn.
-    fn skip_line(&self, y: i32) -> bool {
+    /// allowed (GP0(E1h).10), lines of the field being displayed (see
+    /// `Video::display_field`) are not drawn.
+    pub(super) fn skip_line(&self, y: i32) -> bool {
         let interlaced = DISPLAY_480 | DISPLAY_INTERLACE;
         self.display_mode & interlaced == interlaced
             && self.draw_mode & MODE_DRAW_TO_DISPLAY == 0
-            && (y as u32 & 1) == ((self.display_y + self.video.field()) & 1)
+            && (y as u32 & 1) == ((self.display_y + self.video.display_field()) & 1)
     }
 
     fn blend_mode(&self, command: u32) -> Option<u32> {
