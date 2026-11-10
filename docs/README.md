@@ -8,3 +8,7 @@ Put hardware references here so the model can read them locally.
   open-source emulators' docs, etc.
 
 Code must cite the section it implements (see CLAUDE.md).
+
+To download:
+
+    git clone https://github.com/psx-spx/psx-spx.github.io.git docs/psx-spx

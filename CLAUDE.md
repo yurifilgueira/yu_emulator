@@ -10,7 +10,7 @@ record of the process matter more than speed.
 - `psx-core/` PS1 emulator core. **No file, window, audio or network access.**
               Everything comes in as bytes and goes out as data.
 - `harness/`  headless runner (`cargo run -p psx-harness -- <cmd>`).
-- `docs/`     hardware references. `docs/psx-spx/` is the primary PS1 source.
+- `docs/`     hardware references. `docs/psx-spx/docs/*.md` is the primary PS1 source (start at index.md).
 - `bios/`     BIOS images. **Gitignored. Never commit a BIOS or game image.**
 - `tests/`    test programs (PS-EXE) and reference outputs.
 
