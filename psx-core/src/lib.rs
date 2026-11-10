@@ -6,7 +6,10 @@
 
 pub mod bus;
 pub mod cpu;
+pub mod disasm;
 pub mod map;
+pub mod system;
 
 pub use bus::{BiosError, Bus, BusFault};
 pub use cpu::Cpu;
+pub use system::Psx;
