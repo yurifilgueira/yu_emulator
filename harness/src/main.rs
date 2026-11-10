@@ -40,8 +40,9 @@ fn usage() -> ExitCode {
          boot the BIOS up to its shell, then run the PS-EXE for N cycles;\n      \
          with --expect, stop at the reference log's last line and exit 0 only if the\n      \
          output agrees with it: if the log has \"pass - \"/\"fail - \" lines, every test that\n      \
-         passes in the log must pass and nothing may fail; otherwise the text must match\n      \
-         (blank lines, \"% \" prefixes and ResetGraph: lines are ignored)\n  \
+         passes in the log must pass and nothing may fail; otherwise every line of the log\n      \
+         must appear in the output, in order (blank lines, \"% \" prefixes and ResetGraph:\n      \
+         lines are ignored)\n  \
          harness vram-hash <bios.bin> <file.exe> [--cycles N] [--expect <vram.png>] [--region X,Y,W,H]\n      \
          [--diff-out <png>] [pictures]\n      \
          run the PS-EXE for N cycles and print a hash of VRAM; with --expect, exit 0 only\n      \
@@ -235,18 +236,33 @@ fn judge(expected: &[String], actual: &[String]) -> Verdict {
         return Verdict { pass, summary, details };
     }
 
-    if actual == expected {
-        let summary = format!("output matches the reference log ({} lines)", expected.len());
+    // Other logs are compared as text. Every line of the reference must
+    // appear in the output, in the same order; lines the reference does not
+    // have are allowed in between (released binaries are sometimes newer
+    // than their logs and print more) and are counted in the summary.
+    let mut matched = 0;
+    let mut first_extra = None;
+    for line in actual {
+        if expected.get(matched) == Some(line) {
+            matched += 1;
+        } else if first_extra.is_none() {
+            first_extra = Some(line.clone());
+        }
+    }
+    if matched == expected.len() {
+        let extra = actual.len() - matched;
+        let mut summary = format!("output matches the reference log ({} lines)", expected.len());
+        if extra > 0 {
+            summary += &format!(", plus {extra} lines the log does not have");
+        }
         return Verdict { pass: true, summary, details: Vec::new() };
     }
-    let line = actual.iter().zip(expected).take_while(|(a, e)| a == e).count();
-    let show = |lines: &[String], end: &str| lines.get(line).cloned().unwrap_or_else(|| end.to_string());
     Verdict {
         pass: false,
-        summary: format!("output differs from the reference log at compared line {} of {}", line + 1, expected.len()),
+        summary: format!("reference line {} of {} is missing from the output", matched + 1, expected.len()),
         details: vec![
-            format!("expected: {:?}", show(expected, "<end of log>")),
-            format!("actual:   {:?}", show(actual, "<no more output>")),
+            format!("expected: {:?}", expected[matched]),
+            format!("first unmatched output line: {:?}", first_extra.unwrap_or_else(|| "<no more output>".into())),
         ],
     }
 }
@@ -340,9 +356,6 @@ fn cmd_run(bios: &str, exe: Option<&String>, options: RunOptions) -> ExitCode {
         psx.cpu.epc(),
         psx.cpu.badvaddr()
     );
-    if psx.cpu.gte_unimplemented() > 0 {
-        eprintln!("GTE (COP2) instructions ignored: {}", psx.cpu.gte_unimplemented());
-    }
     let (width, height) = psx.bus.gpu.display_size();
     eprintln!(
         "GPU: {} GP0 words, display {width}x{height}, VRAM hash {:016x}",
@@ -547,6 +560,18 @@ mod tests {
         let v = judge(&expected, &lines("Timer0: 1011\nTimer1: 5012"));
         assert!(!v.pass);
         assert!(v.summary.contains("line 2 of 2"));
+        assert_eq!(v.details[1], "first unmatched output line: \"Timer1: 5012\"");
         assert!(!judge(&expected, &lines("Timer0: 1011")).pass);
+    }
+
+    #[test]
+    fn extra_output_lines_are_allowed_but_reported() {
+        let expected = lines("Passed tests: 1150\nFailed tests: 0\nDone.");
+        let v = judge(&expected, &lines("Passed tests: 1150\nFailed tests: 0\nTotal tests: 1150\nDone."));
+        assert!(v.pass);
+        assert!(v.summary.contains("plus 1 lines"));
+        // Order matters, and a changed value is still a failure.
+        assert!(!judge(&expected, &lines("Failed tests: 0\nPassed tests: 1150\nDone.")).pass);
+        assert!(!judge(&expected, &lines("Passed tests: 969\nFailed tests: 1\nDone.")).pass);
     }
 }
