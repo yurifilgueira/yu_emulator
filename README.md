@@ -11,8 +11,8 @@ mistakes) and the roadmap with acceptance criteria for each phase.
 
 | Subsystem        | Status | Tests |
 |------------------|--------|-------|
-| Bus / memory map | ✅     | 12/12 |
-| CPU (R3000A)     | ⏳     | —     |
+| Bus / memory map | ✅     | 13/13 |
+| CPU (R3000A)     | ✅ boots BIOS to TTY banner; amidog tests pending | 51/51 |
 | Interrupts / DMA / timers | ⏳ | — |
 | GPU              | ⏳     | —     |
 | GTE              | ⏳     | —     |
@@ -27,6 +27,11 @@ Game Boy support is planned after the PS1 (see `ROADMAP.md`).
 ```sh
 cargo test
 cargo run -p psx-harness -- bios bios/your-bios.bin
+
+# boot the BIOS headless; kernel TTY output is printed on stdout
+cargo run --release -p psx-harness -- run bios/your-bios.bin --cycles 20000000
+# same, with an instruction trace on stderr
+cargo run --release -p psx-harness -- run bios/your-bios.bin --cycles 1000 --trace
 ```
 
 ## BIOS and games

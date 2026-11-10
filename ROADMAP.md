@@ -14,17 +14,18 @@ them pass and are recorded in `DEVLOG.md`.
 - [x] I/O ports stubbed and unhandled accesses recorded
 - [x] `harness bios <file>` loads a BIOS and reads the reset vector
 
-## Phase 1 — CPU (R3000A)
+## Phase 1 — CPU (R3000A) ✅ (amidog pending Phase 2)
 
-- [ ] Interpreter for every R3000A instruction
-- [ ] Branch delay slots and load delay slots
-- [ ] COP0: SR, CAUSE, EPC, BadVaddr; exceptions (syscall, break, overflow,
+- [x] Interpreter for every R3000A instruction
+- [x] Branch delay slots and load delay slots
+- [x] COP0: SR, CAUSE, EPC, BadVaddr; exceptions (syscall, break, overflow,
       address error, bus error, reserved instruction); RFE
-- [ ] Unmapped accesses raise bus error (replace the Phase 0 stub)
-- [ ] `harness run <bios> --cycles N` with an instruction trace option
-- [ ] Hook BIOS `putchar` (B-function 0x3D) and print TTY output
-- **Accept:** the BIOS prints its boot text on the terminal; amidog's CPU
-  tests pass once Phase 2 can load them.
+- [x] Unmapped accesses raise bus error (replace the Phase 0 stub)
+- [x] `harness run <bios> --cycles N` with an instruction trace option
+- [x] Hook BIOS `putchar` (B-function 0x3D) and print TTY output
+- **Accept:** the BIOS prints its boot text on the terminal ✅ (OpenBIOS,
+  2026-11-09); amidog's CPU tests pass once Phase 2 can load them (open —
+  carried into Phase 2's acceptance).
 
 ## Phase 2 — Sideload, interrupts, timers, DMA
 
