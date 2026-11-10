@@ -17,6 +17,69 @@ Model: claude-fable-5-2 · Session time: Xh · Human interventions: N
 
 ---
 
+## 2026-11-10 — Phase 4: GTE
+
+Model: claude-fable-5-2 · Session time: ~45 min (estimate, not measured) · Human interventions: 2
+
+- Done (branch `phase-4-gte`, pull request, not on `main`):
+  - `psx-core/src/gte.rs`: the 64 registers with their read/write quirks
+    (sign extension, the H read bug, SXYP push, IRGB/ORGB, LZCR, FLAG
+    mask), the 22 commands, 44-bit MAC overflow and all saturation flags,
+    the Newton-Raphson division with its table.
+  - CPU: MFC2/CFC2 with load delay, MTC2/CTC2, LWC2/SWC2, BC2F/BC2T, GTE
+    commands; a GTE command hit by an interrupt still executes (psx-spx
+    "Interrupts vs GTE Commands"). The `gte_unimplemented` counter is gone.
+  - Harness: a text log now passes if all its lines appear in the output
+    in order; extra output lines are counted, not fatal.
+  - 205 unit tests (194 core, 8 harness, 3 frontend).
+- Results (OpenBIOS):
+  - ps1-tests `gte/test-all`: 1150 passed, 0 failed.
+  - `harness suite`: 16 of 32 programs pass (was 15).
+  - The OpenBIOS shell's cube now shows three differently lit faces and
+    is in a different orientation in screenshots taken 30M cycles apart.
+    In Phase 3 its COP2 instructions were ignored and the picture showed
+    one face and a sliver of a second.
+- Not done:
+  - `gte-fuzz` did not run: it shows a menu and waits for START (seen in a
+    screenshot). Its 3 MB console log holds 1150 cases, the same number as
+    `test-all`, and the one index I compared has the same parameters
+    (RTPT case 20 = `test-all` test 970), so I believe `test-all` is that
+    log compiled into a program — but I only checked one index. Moved to
+    Phase 5's acceptance.
+  - GTE command durations (5-44 cycles) and the 2-3 cycle delay of
+    register writes are not modelled.
+- Broke / surprised us:
+  - `test-all` stopped at test 970 on the first run (969 passed). RTPS/
+    RTPT derive SZ3 from the sum shifted right by 12, and that value has to
+    be truncated to 32 bits before it is saturated: a sum that overflowed
+    44 bits then flips sign and saturates to FFFFh instead of 0. I had kept
+    it 64 bits wide. All 28 unit tests had passed, including my RTPS
+    overflow test, because none of them drove MAC3 that far.
+  - **I wasted almost five minutes of machine time**: I ran `gte-fuzz` for
+    3,000,000,000 cycles to "let it finish" before looking at what it was
+    doing. A 60M-cycle run with a screenshot showed the menu at once.
+  - I left a nonsense placeholder assertion in a unit test
+    (`rtps_depth_cue`) while writing the file and caught it on re-reading,
+    before the first run.
+  - The harness marked `test-all` FAIL although it printed "Failed tests:
+    0", because the released binary prints a "Total tests" line that the
+    2021 log lacks. I changed the judge (extra lines allowed). That makes
+    passing easier, so to be explicit: a reference line that is missing or
+    different still fails, and the summary reports the extra lines.
+  - As in Phase 3, several details are not from psx-spx (where the 44-bit
+    check happens inside a sum, which flags the bugged far-colour MVMVA
+    sets, depth cue only for the last RTPT vertex). They follow what other
+    emulators do, from memory, are marked in `gte.rs`, and are backed by
+    `test-all` passing.
+- How it was found and fixed: `test-all`'s own failure report listed the
+  registers that differed (SZ3 0 vs FFFFh, the IR0 flag), which pointed at
+  the depth value.
+- Human stepped in for: merging pull request #1 (Phase 3), and logging the
+  GitHub CLI in so that I can open pull requests myself.
+- Next: Phase 5, controllers and memory cards. It unblocks three checks
+  that are waiting on a START button: amidog `psxtest_cpx`, `gte-fuzz`,
+  and (with a Sony BIOS) the BIOS menu.
+
 ## 2026-11-10 — Phase 3: GPU, window frontend, first pull request
 
 Model: claude-fable-5-2 · Session time: ~2h (estimate, not measured) · Human interventions: 1

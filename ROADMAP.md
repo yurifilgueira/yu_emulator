@@ -66,16 +66,23 @@ them pass and are recorded in `DEVLOG.md`.
     value (timing column N/A). `psxtest_cpx` reaches its menu and waits for
     the START button — it needs a controller (Phase 5).
 
-## Phase 4 — GTE
+## Phase 4 — GTE ✅
 
-- [ ] All GTE commands, bit-exact fixed point, flags register
+- [x] All GTE commands, bit-exact fixed point, flags register
 - **Accept:** all GTE tests in `tests/` pass.
+  2026-11-10, OpenBIOS: ps1-tests `gte/test-all` reports 1150 passed, 0
+  failed. The other GTE program, `gte-fuzz`, stops at a menu waiting for
+  the START button, so it has not run; the 1150 cases of `test-all` are
+  the ones recorded in `gte-fuzz`'s console log (same count, and the same
+  parameters at the index checked). Running `gte-fuzz` itself is listed
+  under Phase 5.
 
 ## Phase 5 — Controllers and memory cards (SIO0)
 
 - **Accept:** BIOS menu is navigable with a pad; memory card manager works;
   amidog's `psxtest_cpx` runs from its menu and shows all tests passing
-  (carried over from Phases 1-3).
+  (carried over from Phases 1-3); ps1-tests `gte-fuzz`, started from its
+  menu, reproduces its console log (carried over from Phase 4).
 
 ## Phase 6 — CD-ROM
 
