@@ -10,4 +10,5 @@ name = "harness"
 path = "src/main.rs"
 
 [dependencies]
+png = "0.18.1"
 psx-core = { path = "../psx-core" }
