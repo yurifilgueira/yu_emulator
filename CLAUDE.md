@@ -42,7 +42,7 @@ goes in shared crates; hardware emulation is never shared between cores.
 
 ## Git and GitHub
 
-- The project lives in the owner's GitHub repository **Yu-Emulator**,
+- The project lives in the owner's GitHub repository **yurifilgueira/yu_emulator**,
   configured as the `origin` remote. Work on `main` unless told otherwise.
 - After each commit that passes the checks in rule 3, run `git push origin main`.
   Never push a commit with failing tests or clippy warnings.
