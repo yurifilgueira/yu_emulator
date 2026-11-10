@@ -10,6 +10,7 @@ pub mod disasm;
 pub mod dma;
 pub mod exe;
 pub mod gpu;
+pub mod gte;
 pub mod irq;
 pub mod map;
 pub mod spu;
