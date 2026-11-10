@@ -1,0 +1,219 @@
+//! Window frontend.
+//!
+//! Shows what the emulated console sends to the television, or the whole
+//! VRAM, in a desktop window. The emulation itself lives in the core crates;
+//! this crate only moves bytes: files in, pixels out.
+//!
+//! No input devices yet (controllers are Phase 5), and no speed regulation
+//! beyond the window's 60 Hz refresh: one emulated frame per window update.
+
+use minifb::{Key, KeyRepeat, Window, WindowOptions};
+use psx_core::exe::Exe;
+use psx_core::gpu::{rgb15_to_24, VRAM_HEIGHT, VRAM_WIDTH};
+use psx_core::Psx;
+use std::io::Write;
+use std::process::ExitCode;
+
+/// Cycles the BIOS may take to reach its shell before sideloading gives up.
+const BOOT_CYCLES: u64 = 200_000_000;
+/// Upper bound on the cycles emulated per window update, so the window
+/// stays responsive even if the program stops producing frames
+/// (an NTSC frame is about 571,000 cycles, a PAL frame about 680,000).
+const MAX_CYCLES_PER_UPDATE: u64 = 1_000_000;
+
+fn usage() -> ExitCode {
+    eprintln!(
+        "usage: yu-emulator <bios.bin> [program.exe] [--vram] [--frames N]\n\n  \
+         <bios.bin>     PlayStation BIOS image (512 KB)\n  \
+         [program.exe]  PS-EXE to run instead of the BIOS shell\n  \
+         --vram         start with the whole 1024x512 VRAM instead of the display\n  \
+         --frames N     quit after N window updates (for automated checks)\n\n\
+         keys: Tab switches between display and VRAM, Esc quits"
+    );
+    ExitCode::from(2)
+}
+
+struct Options {
+    bios: String,
+    exe: Option<String>,
+    show_vram: bool,
+    frames: Option<u64>,
+}
+
+impl Options {
+    fn parse(args: &[String]) -> Option<Self> {
+        let mut positional = Vec::new();
+        let mut options = Self { bios: String::new(), exe: None, show_vram: false, frames: None };
+        let mut args = args.iter();
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--vram" => options.show_vram = true,
+                "--frames" => options.frames = Some(args.next()?.parse().ok()?),
+                flag if flag.starts_with("--") => return None,
+                _ => positional.push(arg.clone()),
+            }
+        }
+        match positional.as_slice() {
+            [bios] => options.bios = bios.clone(),
+            [bios, exe] => {
+                options.bios = bios.clone();
+                options.exe = Some(exe.clone());
+            }
+            _ => return None,
+        }
+        Some(options)
+    }
+}
+
+/// A picture in the window's pixel format (0x00RRGGBB per pixel).
+struct Picture {
+    width: usize,
+    height: usize,
+    pixels: Vec<u32>,
+}
+
+fn pack(rgb: &[u8]) -> u32 {
+    ((rgb[0] as u32) << 16) | ((rgb[1] as u32) << 8) | rgb[2] as u32
+}
+
+/// The displayed picture. While the GPU reports a zero-sized display (bad
+/// display range registers) a 1x1 black picture stands in.
+fn display_picture(psx: &Psx) -> Picture {
+    let frame = psx.bus.gpu.frame();
+    if frame.width == 0 || frame.height == 0 {
+        return Picture { width: 1, height: 1, pixels: vec![0] };
+    }
+    Picture { width: frame.width, height: frame.height, pixels: frame.rgb.chunks(3).map(pack).collect() }
+}
+
+/// The whole VRAM, textures and palettes included.
+fn vram_picture(psx: &Psx) -> Picture {
+    let pixels = psx.bus.gpu.vram().iter().map(|pixel| pack(&rgb15_to_24(*pixel))).collect();
+    Picture { width: VRAM_WIDTH, height: VRAM_HEIGHT, pixels }
+}
+
+/// Runs the console until the GPU finishes a frame.
+fn run_frame(psx: &mut Psx, tty: &mut impl Write) {
+    let frame = psx.bus.gpu.video.frame();
+    let limit = psx.cycles() + MAX_CYCLES_PER_UPDATE;
+    while psx.bus.gpu.video.frame() == frame && psx.cycles() < limit {
+        psx.step();
+    }
+    let output = psx.take_tty();
+    if !output.is_empty() {
+        // The terminal may be gone; the emulator keeps running regardless.
+        let _ = tty.write_all(&output).and_then(|()| tty.flush());
+    }
+}
+
+fn boot(options: &Options) -> Result<Psx, String> {
+    let bios = std::fs::read(&options.bios).map_err(|e| format!("could not read {}: {e}", options.bios))?;
+    let mut psx = Psx::new(bios).map_err(|e| e.to_string())?;
+    if let Some(path) = &options.exe {
+        let file = std::fs::read(path).map_err(|e| format!("could not read {path}: {e}"))?;
+        let exe = Exe::parse(&file).map_err(|e| format!("{path}: {e}"))?;
+        if !psx.run_to_shell(BOOT_CYCLES) {
+            return Err(format!("BIOS did not reach its shell within {BOOT_CYCLES} cycles"));
+        }
+        psx.take_tty();
+        psx.sideload(&exe);
+    }
+    Ok(psx)
+}
+
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let Some(options) = Options::parse(&args) else { return usage() };
+    let mut psx = match boot(&options) {
+        Ok(psx) => psx,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // The window is created at twice the size of a 320x240 picture and can
+    // be resized; pictures of any size are scaled to fit, keeping their
+    // proportions. (A television shows every mode at 4:3; that correction
+    // is not applied, so 640x240 and similar modes look stretched.)
+    let window_options = WindowOptions { resize: true, scale_mode: minifb::ScaleMode::AspectRatioStretch, ..Default::default() };
+    let mut window = match Window::new("Yu-Emulator", 640, 480, window_options) {
+        Ok(window) => window,
+        Err(e) => {
+            eprintln!("could not open a window: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    window.set_target_fps(60);
+
+    let mut show_vram = options.show_vram;
+    let mut updates = 0u64;
+    let stdout = std::io::stdout();
+    while window.is_open() && !window.is_key_down(Key::Escape) {
+        if window.is_key_pressed(Key::Tab, KeyRepeat::No) {
+            show_vram = !show_vram;
+        }
+        run_frame(&mut psx, &mut stdout.lock());
+        let picture = if show_vram { vram_picture(&psx) } else { display_picture(&psx) };
+        if let Err(e) = window.update_with_buffer(&picture.pixels, picture.width, picture.height) {
+            eprintln!("could not update the window: {e}");
+            return ExitCode::FAILURE;
+        }
+        updates += 1;
+        if options.frames.is_some_and(|limit| updates >= limit) {
+            break;
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parses_arguments() {
+        let o = Options::parse(&args(&["bios.bin"])).unwrap();
+        assert_eq!((o.bios.as_str(), o.exe, o.show_vram, o.frames), ("bios.bin", None, false, None));
+        let o = Options::parse(&args(&["--vram", "bios.bin", "--frames", "3", "game.exe"])).unwrap();
+        assert_eq!((o.exe.as_deref(), o.show_vram, o.frames), (Some("game.exe"), true, Some(3)));
+        assert!(Options::parse(&args(&[])).is_none());
+        assert!(Options::parse(&args(&["a", "b", "c"])).is_none());
+        assert!(Options::parse(&args(&["a", "--frames"])).is_none());
+        assert!(Options::parse(&args(&["a", "--unknown"])).is_none());
+    }
+
+    #[test]
+    fn pictures_use_the_window_pixel_format() {
+        assert_eq!(pack(&[0x12, 0x34, 0x56]), 0x0012_3456);
+        let mut psx = Psx::new(vec![0; psx_core::map::BIOS_SIZE]).unwrap();
+        // Fill 16x1 at (0,0) with pure red through GP0.
+        for word in [0x0200_00FF, 0, (1 << 16) | 16] {
+            psx.bus.store32(0x1F80_1810, word).unwrap();
+        }
+        let vram = vram_picture(&psx);
+        assert_eq!((vram.width, vram.height, vram.pixels.len()), (1024, 512, 1024 * 512));
+        assert_eq!(vram.pixels[0], 0x00FF_0000);
+        assert_eq!(vram.pixels[16], 0);
+        // The display is off after reset: black, at the reset size.
+        let display = display_picture(&psx);
+        assert_eq!((display.width, display.height), (256, 240));
+        assert!(display.pixels.iter().all(|p| *p == 0));
+    }
+
+    #[test]
+    fn run_frame_stops_at_a_frame_boundary_and_forwards_tty() {
+        let mut psx = Psx::new(vec![0; psx_core::map::BIOS_SIZE]).unwrap();
+        let mut tty = Vec::new();
+        run_frame(&mut psx, &mut tty);
+        assert_eq!(psx.bus.gpu.video.frame(), 1);
+        // One NTSC frame: 263 lines of 3413 video cycles at 11/7 per CPU cycle.
+        let expected = 263 * 3413 * 7 / 11;
+        assert!(psx.cycles().abs_diff(expected) <= 1, "{} cycles", psx.cycles());
+        assert!(tty.is_empty());
+    }
+}

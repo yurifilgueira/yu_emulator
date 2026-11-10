@@ -6,6 +6,7 @@
 use crate::irq::{Interrupt, Irq};
 
 pub const CHANNEL_GPU: usize = 2;
+pub const CHANNEL_SPU: usize = 4;
 pub const CHANNEL_OTC: usize = 6;
 
 // psx-spx: "1F801088h+N*10h - D#_CHCR".

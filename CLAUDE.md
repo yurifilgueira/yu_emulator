@@ -10,6 +10,7 @@ record of the process matter more than speed.
 - `psx-core/` PS1 emulator core. **No file, window, audio or network access.**
               Everything comes in as bytes and goes out as data.
 - `harness/`  headless runner (`cargo run -p psx-harness -- <cmd>`).
+- `frontend/` window frontend shared by all systems (`cargo run -p frontend -- <bios>`).
 - `docs/`     hardware references. `docs/psx-spx/docs/*.md` is the primary PS1 source (start at index.md).
 - `bios/`     BIOS images. **Gitignored. Never commit a BIOS or game image.**
 - `tests/`    test programs (PS-EXE) and reference outputs.
@@ -30,7 +31,7 @@ goes in shared crates; hardware emulation is never shared between cores.
    `cargo clippy --all-targets -- -D warnings` must be clean.
 4. **One commit per meaningful step**, with a clear message. The git history
    is part of the showcase.
-5. **Push after every commit** (see "Git and GitHub" below).
+5. **Push after every commit**, to the work branch (see "Git and GitHub" below).
 6. **Keep `DEVLOG.md` updated** at the end of every session: what was done,
    what broke, how it was found, how it was fixed, and anything the human had
    to step in for. Be honest about mistakes; that is the valuable part.
@@ -43,17 +44,27 @@ goes in shared crates; hardware emulation is never shared between cores.
 ## Git and GitHub
 
 - The project lives in the owner's GitHub repository **yurifilgueira/yu_emulator**,
-  configured as the `origin` remote. Work on `main` unless told otherwise.
-- After each commit that passes the checks in rule 3, run `git push origin main`.
-  Never push a commit with failing tests or clippy warnings.
+  configured as the `origin` remote.
+- **Nothing goes to `main` directly.** Work on a branch (one per phase or
+  per self-contained piece of work, e.g. `phase-3-gpu`), and open a pull
+  request for the owner to review. Do not merge it yourself.
+- After each commit that passes the checks in rule 3, push the branch
+  (`git push origin <branch>`). Never push a commit with failing tests or
+  clippy warnings.
+- The pull request description must let a reader understand the objective
+  without opening the diff: what it is for, what it changes, how it was
+  verified (commands and results), what is known to be wrong or missing,
+  and anything the owner has to decide.
 - At the end of a session, make sure `DEVLOG.md` is committed and pushed, so
   the repository always reflects where the project stands.
 - If `origin` is missing or the push fails (authentication, rejected,
   diverged history), **stop and tell the human**. Never force-push, never
   rewrite published history, never change the remote URL on your own.
-- Before every push, check that no BIOS, game image or other copyrighted
-  binary is staged (`git status`, `git diff --cached --stat`). If one is,
-  unstage it and tell the human.
+- Before every commit, look at what is staged (`git status`,
+  `git diff --cached --stat`) and check that it holds only what the commit
+  is about: no BIOS, game image or other copyrighted binary, and no
+  downloaded or scratch files. If something else is staged, unstage it and
+  tell the human.
 
 ## Conventions
 

@@ -9,16 +9,16 @@ mistakes) and the roadmap with acceptance criteria for each phase.
 
 ## Status — PlayStation
 
-| Subsystem        | Status | Tests |
-|------------------|--------|-------|
+| Subsystem        | Status | Checked by |
+|------------------|--------|------------|
 | Bus / memory map | ✅     | unit tests |
-| CPU (R3000A)     | ✅ boots BIOS to TTY banner; ps1-tests `cpu/cop`, `cpu/code-in-io` pass; amidog needs GPU | unit tests + 2 test programs |
-| Interrupts / DMA / timers | ✅ functional, not cycle-exact; ps1-tests `dma/otc-test` passes | unit tests + 1 test program |
-| GPU              | ⏳     | —     |
+| CPU (R3000A)     | ✅ boots the BIOS; amidog `psxtest_cpu` all OK | unit tests, ps1-tests `cpu/cop`, `cpu/code-in-io`, amidog |
+| Interrupts / DMA / timers | ✅ functional, not cycle-exact | unit tests, ps1-tests `dma/otc-test`, `dma/dpcr` |
+| GPU              | ✅ software rasteriser; 9 of 11 ps1-tests VRAM references match exactly | unit tests, ps1-tests `gpu/*` |
 | GTE              | ⏳     | —     |
 | Controllers      | ⏳     | —     |
 | CD-ROM           | ⏳     | —     |
-| SPU / MDEC       | ⏳     | —     |
+| SPU / MDEC       | ⏳ (SPU: only sound RAM transfers) | — |
 
 Game Boy support is planned after the PS1 (see `ROADMAP.md`).
 
@@ -36,15 +36,28 @@ cargo run --release -p psx-harness -- run bios/your-bios.bin --cycles 1000 --tra
 # run a PS-EXE (the BIOS boots first, then the program replaces the shell)
 cargo run --release -p psx-harness -- exe bios/your-bios.bin tests/ps1-tests/cpu/cop/cop.exe \
     --expect tests/ps1-tests/cpu/cop/psx.log
-# run every test program that ships with a console log and print a table
+# save the displayed picture and the whole VRAM as PNG
+cargo run --release -p psx-harness -- exe bios/your-bios.bin tests/amidog/psxtest_cpu.exe \
+    --cycles 300000000 --frame-out screen.png --vram-out vram.png
+# compare VRAM with a reference image
+cargo run --release -p psx-harness -- vram-hash bios/your-bios.bin tests/ps1-tests/gpu/quad/quad.exe \
+    --expect tests/ps1-tests/gpu/quad/vram.png
+# run every test program that ships with a console log or VRAM image
 cargo run --release -p psx-harness -- suite bios/your-bios.bin tests/ps1-tests
+
+# open a window (Tab: display / whole VRAM, Esc: quit)
+cargo run --release -p frontend -- bios/your-bios.bin [program.exe]
 ```
 
-`cargo test` runs 109 unit tests and needs no BIOS. The test programs are not
+`cargo test` runs 171 unit tests and needs no BIOS. The test programs are not
 in the repository: unpack the [ps1-tests](https://github.com/JaCzekanski/ps1-tests/releases)
 release into `tests/ps1-tests/` and amidog's CPU tests into `tests/amidog/`
-(both gitignored). Currently 3 of the 21 ps1-tests programs that have a
-console log pass; most of the others exercise hardware from later phases.
+(both gitignored). Currently 15 of the 32 ps1-tests programs that have a
+console reference pass; most of the others exercise hardware from later
+phases.
+
+The window frontend has no input yet and runs at about a third of real time;
+speed is a later phase.
 
 ## BIOS and games
 

@@ -41,16 +41,30 @@ them pass and are recorded in `DEVLOG.md`.
   results on screen and wait on GPUSTAT, so they need the Phase 3 GPU;
   ps1-tests `cpu/access-time` needs cycle-accurate memory timing (Phase 8).
 
-## Phase 3 — GPU
+## Phase 3 — GPU ✅ (Sony BIOS menu and amidog `psxtest_cpx` not verifiable yet)
 
-- [ ] GP0/GP1 commands, VRAM 1024x512, software rasteriser
-- [ ] Polygons (flat, Gouraud, textured), rectangles, lines, transfers
-- [ ] Semi-transparency, dithering, texture windows, masking
-- [ ] `frontend` crate with a window showing VRAM / display area
-- [ ] `harness vram-hash` compares output against reference images
+- [x] GP0/GP1 commands, VRAM 1024x512, software rasteriser
+- [x] Polygons (flat, Gouraud, textured), rectangles, lines, transfers
+- [x] Semi-transparency, dithering, texture windows, masking
+- [x] `frontend` crate with a window showing VRAM / display area
+- [x] `harness vram-hash` compares output against reference images
 - **Accept:** BIOS shell (memory card / CD player menu) renders; GPU test
   programs match their reference images; amidog's `psxtest_cpu` and
   `psxtest_cpx` show all tests passing (carried over from Phases 1-2).
+  Status on 2026-11-10, OpenBIOS:
+  - BIOS shell: OpenBIOS's shell (a rotating cube, 640x480 interlaced)
+    renders. The memory card / CD player menu is Sony's shell and has not
+    been run: no Sony BIOS is available here.
+  - ps1-tests GPU programs with a `vram.png`: 9 of 11 match every pixel of
+    VRAM (`clipping`, `clut-cache`, `quad`, `rectangles`, `texture-flip`,
+    `texture-overflow`, `triangle`, `uv-interpolation`,
+    `vram-to-vram-overlap`). `transparency` matches in the 320x240 area it
+    draws (the reference has white elsewhere); `lines` differs in 64 pixels
+    whose colour the test program leaves uninitialised. `gp0-e1` and
+    `mask-bit` pass against their logs; `bandwidth` needs GPU timing.
+  - amidog `psxtest_cpu`: every test shows OK for exception, flag and
+    value (timing column N/A). `psxtest_cpx` reaches its menu and waits for
+    the START button — it needs a controller (Phase 5).
 
 ## Phase 4 — GTE
 
@@ -59,7 +73,9 @@ them pass and are recorded in `DEVLOG.md`.
 
 ## Phase 5 — Controllers and memory cards (SIO0)
 
-- **Accept:** BIOS menu is navigable with a pad; memory card manager works.
+- **Accept:** BIOS menu is navigable with a pad; memory card manager works;
+  amidog's `psxtest_cpx` runs from its menu and shows all tests passing
+  (carried over from Phases 1-3).
 
 ## Phase 6 — CD-ROM
 
