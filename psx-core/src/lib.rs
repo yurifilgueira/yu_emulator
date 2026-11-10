@@ -7,8 +7,13 @@
 pub mod bus;
 pub mod cpu;
 pub mod disasm;
+pub mod dma;
+pub mod exe;
+pub mod irq;
 pub mod map;
 pub mod system;
+pub mod timers;
+pub mod video;
 
 pub use bus::{BiosError, Bus, BusFault};
 pub use cpu::Cpu;

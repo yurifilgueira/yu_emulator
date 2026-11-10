@@ -17,7 +17,7 @@
 //!   Implemented with an in-flight `(register, value)` pair that is committed
 //!   after the following instruction has read its operands.
 
-use crate::bus::Bus;
+use crate::bus::{Bus, Width};
 use crate::map;
 
 /// psx-spx: "COP0 - Exception Handling" — ExcCode values of CAUSE.
@@ -51,7 +51,6 @@ const SR_KUC: u32 = 1 << 1;
 const SR_ISC: u32 = 1 << 16;
 const SR_BEV: u32 = 1 << 22;
 const SR_CU0: u32 = 1 << 28;
-const SR_CU2: u32 = 1 << 30;
 /// Bits 6-7, 23-24 and 26-27 are "Not used (zero)".
 const SR_WRITE_MASK: u32 = 0xF27F_FF3F;
 
@@ -462,28 +461,15 @@ impl Cpu {
         bus.load32(addr).map_err(|_| Exception::BusData)
     }
 
-    fn store8(&mut self, bus: &mut Bus, addr: u32, value: u8) -> Result<(), Exception> {
-        self.check_address(addr, 1, Exception::AddressStore)?;
+    /// Stores take the whole register even for narrow widths: psx-spx
+    /// "Caution - 8/16-bit writes to certain IO registers" — "all 32 bits of
+    /// the GPR are placed on the bus".
+    fn store(&mut self, bus: &mut Bus, addr: u32, width: Width, value: u32) -> Result<(), Exception> {
+        self.check_address(addr, width.bytes() as u32, Exception::AddressStore)?;
         if self.cache_isolated() {
             return Ok(());
         }
-        bus.store8(addr, value).map_err(|_| Exception::BusData)
-    }
-
-    fn store16(&mut self, bus: &mut Bus, addr: u32, value: u16) -> Result<(), Exception> {
-        self.check_address(addr, 2, Exception::AddressStore)?;
-        if self.cache_isolated() {
-            return Ok(());
-        }
-        bus.store16(addr, value).map_err(|_| Exception::BusData)
-    }
-
-    fn store32(&mut self, bus: &mut Bus, addr: u32, value: u32) -> Result<(), Exception> {
-        self.check_address(addr, 4, Exception::AddressStore)?;
-        if self.cache_isolated() {
-            return Ok(());
-        }
-        bus.store32(addr, value).map_err(|_| Exception::BusData)
+        bus.store(addr, width, value).map_err(|_| Exception::BusData)
     }
 
     /// Value of `reg` as seen by LWL/LWR: unlike every other instruction they
@@ -555,11 +541,13 @@ impl Cpu {
 
             0x10 => return self.execute_cop0(i),
             // psx-spx: "cop0r12 - SR": COP1/COP3 "none in PSX". psx-spx does
-            // not say what happens if CU1/CU3 are set and they are used;
-            // treated as coprocessor unusable either way.
-            0x11 => return Err(self.coprocessor_unusable(1)),
+            // not say what using them does. On hardware (ps1-tests cpu/cop:
+            // testCop1Enabled, testCop3Disabled, ...) they raise coprocessor
+            // unusable only while their CU bit is clear, and are otherwise
+            // ignored.
+            0x11 => self.require_cop(1)?,
             0x12 => return self.execute_cop2(i),
-            0x13 => return Err(self.coprocessor_unusable(3)),
+            0x13 => self.require_cop(3)?,
 
             // psx-spx: "CPU Load/Store Opcodes".
             0x20 => {
@@ -606,8 +594,8 @@ impl Cpu {
                 };
                 self.load_delayed(i.rt(), value);
             }
-            0x28 => self.store8(bus, addr, rt as u8)?,
-            0x29 => self.store16(bus, addr, rt as u16)?,
+            0x28 => self.store(bus, addr, Width::Byte, rt)?,
+            0x29 => self.store(bus, addr, Width::Half, rt)?,
             0x2A => {
                 // SWL. psx-spx: "Unaligned Load/Store (Details)".
                 let aligned = addr & !3;
@@ -618,9 +606,9 @@ impl Cpu {
                     2 => (mem & 0xFF00_0000) | (rt >> 8),
                     _ => rt,
                 };
-                self.store32(bus, aligned, value)?;
+                self.store(bus, aligned, Width::Word, value)?;
             }
-            0x2B => self.store32(bus, addr, rt)?,
+            0x2B => self.store(bus, addr, Width::Word, rt)?,
             0x2E => {
                 // SWR. psx-spx: "Unaligned Load/Store (Details)".
                 let aligned = addr & !3;
@@ -631,26 +619,28 @@ impl Cpu {
                     2 => (mem & 0x0000_FFFF) | (rt << 16),
                     _ => (mem & 0x00FF_FFFF) | (rt << 24),
                 };
-                self.store32(bus, aligned, value)?;
+                self.store(bus, aligned, Width::Word, value)?;
             }
 
-            // psx-spx: "COP0 - Misc" — "mov [mem],cop0reg / mov cop0reg,[mem]"
-            // are not supported and raise coprocessor unusable. COP1/COP3
-            // do not exist (see 0x11/0x13 above).
-            0x30 | 0x38 => return Err(self.coprocessor_unusable(0)),
-            0x31 | 0x39 => return Err(self.coprocessor_unusable(1)),
-            0x33 | 0x3B => return Err(self.coprocessor_unusable(3)),
+            // LWCn/SWCn for the coprocessors without loadable registers.
+            // Deviation from psx-spx "COP0 - Misc", which says "mov
+            // [mem],cop0reg" always raises coprocessor unusable: hardware
+            // (ps1-tests cpu/cop: testSwc0Enabled/Disabled, testSwc3*)
+            // raises it only while the CU bit is clear — for COP0 even in
+            // kernel mode — and otherwise does nothing visible. Whether a
+            // memory access happens in that case is unknown; none is made.
+            0x30 | 0x31 | 0x33 | 0x38 | 0x39 | 0x3B => self.require_cop(i.op() & 3)?,
             0x32 => {
                 // LWC2: GTE data register load. GTE is Phase 4; the memory
                 // access (and its exceptions) still happens.
-                self.require_cop2()?;
+                self.require_cop(2)?;
                 self.load32(bus, addr)?;
                 self.gte_unimplemented += 1;
             }
             0x3A => {
                 // SWC2: stores a GTE data register (reads as zero for now).
-                self.require_cop2()?;
-                self.store32(bus, addr, 0)?;
+                self.require_cop(2)?;
+                self.store(bus, addr, Width::Word, 0)?;
                 self.gte_unimplemented += 1;
             }
 
@@ -816,16 +806,25 @@ impl Cpu {
                 let sr = self.cop0.sr;
                 self.cop0.sr = (sr & !0x0F) | ((sr >> 2) & 0x0F);
             }
-            // TLBR/TLBWI/TLBWR/TLBP and anything else: RI.
+            // psx-spx: "cop0cmd=01h,02h,06h,08h - TLBR,TLBWI,TLBWR,TLBP":
+            // reserved instruction.
+            0x10..=0x1F if matches!(i.funct(), 0x01 | 0x02 | 0x06 | 0x08) => {
+                return Err(Exception::Reserved);
+            }
+            // Any other COP0 command does nothing. Not covered by psx-spx;
+            // hardware result from ps1-tests cpu/cop testCop0InvalidOpcode
+            // (cop0cmd=00h raises no exception).
+            0x10..=0x1F => {}
             _ => return Err(Exception::Reserved),
         }
         Ok(())
     }
 
-    fn require_cop2(&mut self) -> Result<(), Exception> {
-        // psx-spx: "cop0r12 - SR" bit 30 (CU2).
-        if self.cop0.sr & SR_CU2 == 0 {
-            return Err(self.coprocessor_unusable(2));
+    /// psx-spx: "cop0r12 - SR" bits 28-31 (CU0-CU3): using a coprocessor
+    /// whose bit is clear raises coprocessor unusable with CE = its number.
+    fn require_cop(&mut self, number: u32) -> Result<(), Exception> {
+        if self.cop0.sr & (SR_CU0 << number) == 0 {
+            return Err(self.coprocessor_unusable(number));
         }
         Ok(())
     }
@@ -834,7 +833,7 @@ impl Cpu {
     /// nothing and register reads return zero, and each use is counted so
     /// the harness can report it.
     fn execute_cop2(&mut self, i: Instr) -> Result<(), Exception> {
-        self.require_cop2()?;
+        self.require_cop(2)?;
         self.gte_unimplemented += 1;
         if matches!(i.rs(), 0x00 | 0x02) {
             // MFC2/CFC2 have a load delay like memory loads.
@@ -1529,6 +1528,7 @@ mod tests {
             mfc0(1, 10),             // cop0r10 N/A
             0x4200_0001,             // TLBR
             0x4200_0008,             // TLBP
+            (0x10 << 26) | (2 << 21), // CFC0
         ] {
             let m = Machine::run(&[instr]);
             assert_eq!(m.excode(), Exception::Reserved as u32, "instr 0x{instr:08X}");
@@ -1548,9 +1548,28 @@ mod tests {
         let m = Machine::run(&[0x30 << 26]); // LWC0
         assert_eq!((m.excode(), ce(&m)), (0x0B, 0));
 
+        let m = Machine::run(&[0x3B << 26]); // SWC3
+        assert_eq!((m.excode(), ce(&m)), (0x0B, 3));
+
+        // Enabled coprocessors raise nothing, even the missing ones and even
+        // for meaningless commands (hardware: ps1-tests cpu/cop).
+        for (instr, sr) in [
+            (0x11 << 26, SR_CU0 << 1),               // COP1
+            (0x13 << 26, SR_CU0 << 3),               // COP3
+            (0x38 << 26, SR_CU0),                    // SWC0
+            (0x3B << 26, SR_CU0 << 3),               // SWC3
+            ((0x10 << 26) | (0x1F << 21), SR_CU0),   // cop0 command 0
+            ((0x12 << 26) | (0x1F << 21), (SR_CU0 << 2)),   // cop2 command 0
+        ] {
+            let mut m = Machine::new(&[instr]);
+            m.cpu.cop0.sr = sr;
+            m.steps(1);
+            assert_eq!(m.cpu.pc(), BASE + 4, "instr 0x{instr:08X}");
+        }
+
         // COP2 enabled: no exception (GTE itself is Phase 4).
         let mut m = Machine::new(&[0x4A00_0001]);
-        m.cpu.cop0.sr = SR_CU2;
+        m.cpu.cop0.sr = SR_CU0 << 2;
         m.steps(1);
         assert_eq!(m.cpu.pc(), BASE + 4);
         assert_eq!(m.cpu.gte_unimplemented(), 1);

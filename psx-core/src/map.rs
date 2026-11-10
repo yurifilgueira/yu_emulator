@@ -70,6 +70,13 @@ pub const SCRATCHPAD: Range = Range::new(0x1F80_0000, SCRATCHPAD_SIZE as u32);
 pub const IO_PORTS: Range = Range::new(0x1F80_1000, 0x2000);
 pub const EXPANSION_2: Range = Range::new(0x1F80_2000, 0x2000);
 
+/// Expansion region 3 ("DEV1 expansion (SRAM BIOS region for DTL cards)").
+/// psx-spx: "Memory Map". Nothing connected on a retail console.
+pub const EXPANSION_3: Range = Range::new(0x1FA0_0000, 2 * 1024 * 1024);
+
+/// SPU registers. psx-spx: "SPU I/O Port Summary" (1F801C00h..1F801FFFh).
+pub const SPU: Range = Range::new(0x1F80_1C00, 0x400);
+
 /// BIOS ROM: 512 KB.
 pub const BIOS_SIZE: usize = 512 * 1024;
 pub const BIOS: Range = Range::new(0x1FC0_0000, BIOS_SIZE as u32);
