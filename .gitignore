@@ -1,0 +1,8 @@
+/target
+/bios/*
+!/bios/README.md
+*.bin
+*.cue
+*.iso
+*.img
+*.chd

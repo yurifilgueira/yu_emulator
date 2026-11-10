@@ -1,0 +1,13 @@
+[package]
+name = "psx-harness"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Headless runner: loads BIOS / test programs and reports pass/fail."
+
+[[bin]]
+name = "harness"
+path = "src/main.rs"
+
+[dependencies]
+psx-core = { path = "../core" }

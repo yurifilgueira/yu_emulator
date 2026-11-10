@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["core", "harness"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+
+[profile.release]
+debug = true          # keep symbols for profiling
+codegen-units = 1
+lto = "thin"
+
+[profile.dev]
+opt-level = 1         # unoptimized emulators are painfully slow even in tests

@@ -1,0 +1,8 @@
+[package]
+name = "psx-core"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "PlayStation (PS1) emulator core: no I/O, no windowing, no audio backends."
+
+[dependencies]
