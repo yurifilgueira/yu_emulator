@@ -88,9 +88,36 @@ impl Gpu {
         }
     }
 
-    /// Reads a texel. Deviation: neither the texture cache nor the CLUT
-    /// cache (psx-spx: "GPU Texture Caching") is emulated; VRAM is read
-    /// directly every time.
+    /// Builds the texture description for a primitive and makes sure the
+    /// CLUT cache holds its palette.
+    ///
+    /// psx-spx: "GPU Texture Caching" — "The CLUT cache is invalidated when
+    /// different CLUT index values are used or when GP0(01h) is issued."
+    /// So a palette changed in VRAM is not seen until one of those happens.
+    /// Not in psx-spx, from the reference image of ps1-tests gpu/clut-cache:
+    /// a 4-bit texture loads 16 entries and an 8-bit one 256, so going from
+    /// 4-bit to 8-bit with the same CLUT reloads it, while going from 8-bit
+    /// to 4-bit keeps using the cached entries.
+    fn prepare_texture(&mut self, clut: u32) -> Texture {
+        let texture = self.texture(clut);
+        if texture.depth < 2 {
+            let clut = clut & 0x7FFF;
+            let full = texture.depth == 1;
+            let cached = matches!(self.clut_cache_key, Some((c, has_full)) if c == clut && (has_full || !full));
+            if !cached {
+                let entries = if full { 256 } else { 16 };
+                for index in 0..entries {
+                    let x = (texture.clut_x + index) % VRAM_WIDTH;
+                    self.clut_cache[index] = self.vram[texture.clut_y * VRAM_WIDTH + x];
+                }
+                self.clut_cache_key = Some((clut, full));
+            }
+        }
+        texture
+    }
+
+    /// Reads a texel. Deviation: the texture cache (psx-spx: "GPU Texture
+    /// Caching") is not emulated; texture pages are read from VRAM directly.
     fn texel(&self, texture: &Texture, u: i32, v: i32) -> u16 {
         // psx-spx: "GP0(E2h) - Texture Window setting":
         // Texcoord = (Texcoord AND (NOT (Mask*8))) OR ((Offset AND Mask)*8).
@@ -104,10 +131,7 @@ impl Gpu {
 
         let row = ((texture.page_y + v) % VRAM_HEIGHT) * VRAM_WIDTH;
         let at = |x: usize| self.vram[row + x % VRAM_WIDTH];
-        let clut = |index: u16| {
-            let x = (texture.clut_x + index as usize) % VRAM_WIDTH;
-            self.vram[texture.clut_y * VRAM_WIDTH + x]
-        };
+        let clut = |index: u16| self.clut_cache[index as usize];
         match texture.depth {
             // "4bit Texture": four palette indices per halfword, left first.
             0 => clut((at(texture.page_x + u / 4) >> ((u & 3) * 4)) & 0xF),
@@ -233,17 +257,15 @@ impl Gpu {
                 // contains texture page information."
                 match k {
                     0 => clut = uv >> 16,
-                    1 => {
-                        let page = (uv >> 16) & MODE_TPAGE_ATTRIBUTE;
-                        self.draw_mode = (self.draw_mode & !MODE_TPAGE_ATTRIBUTE) | page;
-                    }
+                    1 => self.set_draw_mode(uv >> 16, MODE_TPAGE_ATTRIBUTE),
                     _ => {}
                 }
             }
         }
 
+        let texture = textured.then(|| self.prepare_texture(clut));
         let style = Style {
-            texture: textured.then(|| self.texture(clut)),
+            texture,
             raw,
             blend: self.blend_mode(command),
             // "POLYGONs (triangles/quads) are dithered ONLY if they do use
@@ -488,10 +510,11 @@ impl Gpu {
             y0 = self.clip_y1;
         }
 
+        // "the texture page must be set up separately for Rectangles, via
+        // GP0(E1h)".
+        let texture = textured.then(|| self.prepare_texture(clut));
         let style = Style {
-            // "the texture page must be set up separately for Rectangles,
-            // via GP0(E1h)".
-            texture: textured.then(|| self.texture(clut)),
+            texture,
             raw: command & (1 << 24) != 0,
             blend: self.blend_mode(command),
             // "RECTs are NOT dithered (no matter if they do use modulation

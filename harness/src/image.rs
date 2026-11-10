@@ -75,22 +75,34 @@ pub struct Comparison {
     pub first: Option<(usize, usize, [u8; 3], [u8; 3])>,
 }
 
-pub fn compare(expected: &Rgb, actual: &Rgb) -> Result<Comparison, String> {
+/// A rectangle of an image: x, y, width, height.
+pub type Region = (usize, usize, usize, usize);
+
+/// Compares two images, or only `region` of them.
+pub fn compare(expected: &Rgb, actual: &Rgb, region: Option<Region>) -> Result<Comparison, String> {
     if (expected.width, expected.height) != (actual.width, actual.height) {
         return Err(format!(
             "size mismatch: reference is {}x{}, output is {}x{}",
             expected.width, expected.height, actual.width, actual.height
         ));
     }
-    let mut result = Comparison { total: expected.width * expected.height, different: 0, max_delta: 0, first: None };
+    let (rx, ry, rw, rh) = region.unwrap_or((0, 0, expected.width, expected.height));
+    if rx + rw > expected.width || ry + rh > expected.height {
+        return Err(format!("region {rx},{ry},{rw},{rh} is outside the {}x{} image", expected.width, expected.height));
+    }
+    let mut result = Comparison { total: rw * rh, different: 0, max_delta: 0, first: None };
     for (i, (e, a)) in expected.data.chunks(3).zip(actual.data.chunks(3)).enumerate() {
+        let (x, y) = (i % expected.width, i / expected.width);
+        if x < rx || x >= rx + rw || y < ry || y >= ry + rh {
+            continue;
+        }
         let e5 = [e[0] >> 3, e[1] >> 3, e[2] >> 3];
         let a5 = [a[0] >> 3, a[1] >> 3, a[2] >> 3];
         if e5 != a5 {
             result.different += 1;
             let delta = (0..3).map(|k| e5[k].abs_diff(a5[k])).max().unwrap_or(0);
             result.max_delta = result.max_delta.max(delta);
-            result.first.get_or_insert((i % expected.width, i / expected.width, e5, a5));
+            result.first.get_or_insert((x, y, e5, a5));
         }
     }
     Ok(result)
@@ -132,18 +144,22 @@ mod tests {
     fn comparison_ignores_the_low_three_bits() {
         let a = image(&[[0xF8, 0x00, 0x80], [8, 8, 8]]);
         let b = image(&[[0xFF, 0x07, 0x87], [8, 8, 8]]);
-        assert_eq!(compare(&a, &b).unwrap().different, 0);
+        assert_eq!(compare(&a, &b, None).unwrap().different, 0);
     }
 
     #[test]
     fn comparison_reports_differences() {
         let a = image(&[[0, 0, 0], [0xF8, 0, 0], [0, 0, 0]]);
         let b = image(&[[0, 0, 0], [0xE0, 0, 8], [0, 0, 0]]);
-        let c = compare(&a, &b).unwrap();
+        let c = compare(&a, &b, None).unwrap();
         assert_eq!((c.total, c.different, c.max_delta), (3, 1, 3));
         assert_eq!(c.first, Some((1, 0, [31, 0, 0], [28, 0, 1])));
         assert_eq!(&difference(&a, &b).data[3..6], &[255, 0, 255]);
-        assert!(compare(&a, &image(&[[0, 0, 0]])).is_err(), "size mismatch");
+        assert!(compare(&a, &image(&[[0, 0, 0]]), None).is_err(), "size mismatch");
+        // Restricted to a region that excludes the differing pixel.
+        let c = compare(&a, &b, Some((2, 0, 1, 1))).unwrap();
+        assert_eq!((c.total, c.different), (1, 0));
+        assert!(compare(&a, &b, Some((2, 0, 2, 1))).is_err(), "region outside the image");
     }
 
     #[test]

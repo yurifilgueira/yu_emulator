@@ -42,11 +42,12 @@ fn usage() -> ExitCode {
          output agrees with it: if the log has \"pass - \"/\"fail - \" lines, every test that\n      \
          passes in the log must pass and nothing may fail; otherwise the text must match\n      \
          (blank lines, \"% \" prefixes and ResetGraph: lines are ignored)\n  \
-         harness vram-hash <bios.bin> <file.exe> [--cycles N] [--expect <vram.png>] [--diff-out <png>] [pictures]\n      \
+         harness vram-hash <bios.bin> <file.exe> [--cycles N] [--expect <vram.png>] [--region X,Y,W,H]\n      \
+         [--diff-out <png>] [pictures]\n      \
          run the PS-EXE for N cycles and print a hash of VRAM; with --expect, exit 0 only\n      \
          if every VRAM pixel equals the 1024x512 reference image at 5 bits per channel\n      \
-         (the mask bit is not in the image and is not compared); --diff-out marks the\n      \
-         differing pixels\n  \
+         (the mask bit is not in the image and is not compared); --region limits the\n      \
+         comparison to a rectangle, --diff-out marks the differing pixels\n  \
          harness suite <bios.bin> <dir> [--cycles N]\n      \
          run every PS-EXE under <dir> that has a {REFERENCE_LOG} or {REFERENCE_VRAM} next to it, judge\n      \
          each like `exe --expect` / `vram-hash --expect`, and print a table; exit 0 only\n      \
@@ -61,11 +62,13 @@ fn main() -> ExitCode {
     match args.as_slice() {
         [cmd, path] if cmd == "bios" => cmd_bios(path),
         [cmd, path, options @ ..] if cmd == "run" => match RunOptions::parse(options) {
-            Some(options) if options.expect.is_none() && options.diff_out.is_none() => cmd_run(path, None, options),
+            Some(options) if options.expect.is_none() && options.diff_out.is_none() && options.region.is_none() => {
+                cmd_run(path, None, options)
+            }
             _ => usage(),
         },
         [cmd, path, exe, options @ ..] if cmd == "exe" => match RunOptions::parse(options) {
-            Some(options) if options.diff_out.is_none() => cmd_run(path, Some(exe), options),
+            Some(options) if options.diff_out.is_none() && options.region.is_none() => cmd_run(path, Some(exe), options),
             _ => usage(),
         },
         [cmd, path, exe, options @ ..] if cmd == "vram-hash" => match RunOptions::parse(options) {
@@ -118,6 +121,8 @@ struct RunOptions {
     vram_out: Option<String>,
     frame_out: Option<String>,
     diff_out: Option<String>,
+    /// --region X,Y,W,H: the part of VRAM that vram-hash --expect compares.
+    region: Option<image::Region>,
 }
 
 impl RunOptions {
@@ -130,6 +135,7 @@ impl RunOptions {
             vram_out: None,
             frame_out: None,
             diff_out: None,
+            region: None,
         };
         let mut args = args.iter();
         while let Some(arg) = args.next() {
@@ -144,6 +150,11 @@ impl RunOptions {
                 "--vram-out" => options.vram_out = Some(args.next()?.clone()),
                 "--frame-out" => options.frame_out = Some(args.next()?.clone()),
                 "--diff-out" => options.diff_out = Some(args.next()?.clone()),
+                "--region" => {
+                    let numbers: Vec<usize> = args.next()?.split(',').map(|n| n.parse().ok()).collect::<Option<_>>()?;
+                    let [x, y, w, h] = numbers[..] else { return None };
+                    options.region = Some((x, y, w, h));
+                }
                 _ => return None,
             }
         }
@@ -152,7 +163,8 @@ impl RunOptions {
 
     /// Only --cycles was given.
     fn is_plain(&self) -> bool {
-        !self.trace && [&self.expect, &self.vram_out, &self.frame_out, &self.diff_out].iter().all(|o| o.is_none())
+        let paths = [&self.expect, &self.vram_out, &self.frame_out, &self.diff_out];
+        !self.trace && self.region.is_none() && paths.iter().all(|o| o.is_none())
     }
 
     /// Writes the pictures requested with --vram-out / --frame-out.
@@ -368,8 +380,8 @@ fn report(verdict: Verdict) -> ExitCode {
 // ---- VRAM comparison ----------------------------------------------------------
 
 /// Compares VRAM with a reference picture of it.
-fn judge_vram(reference: &Rgb, psx: &Psx) -> Result<Verdict, String> {
-    let c = image::compare(reference, &Rgb::from_vram(psx.bus.gpu.vram()))?;
+fn judge_vram(reference: &Rgb, psx: &Psx, region: Option<image::Region>) -> Result<Verdict, String> {
+    let c = image::compare(reference, &Rgb::from_vram(psx.bus.gpu.vram()), region)?;
     let mut details = Vec::new();
     if let Some((x, y, expected, actual)) = c.first {
         details.push(format!("first difference at ({x},{y}): expected rgb5 {expected:?}, got {actual:?}"));
@@ -417,7 +429,7 @@ fn cmd_vram_hash(bios: &str, exe: &str, options: RunOptions) -> ExitCode {
             }
         }
     }
-    match judge_vram(&reference, &psx) {
+    match judge_vram(&reference, &psx, options.region) {
         Ok(verdict) => report(verdict),
         Err(e) => fail(e),
     }
@@ -475,7 +487,7 @@ fn cmd_suite(bios: &str, dir: &str, options: RunOptions) -> ExitCode {
             Rgb::read_png(&exe.with_file_name(REFERENCE_VRAM)).and_then(|reference| {
                 let (mut psx, start) = boot(&bios_data, Some(exe))?;
                 run(&mut psx, start, &options, None, false);
-                judge_vram(&reference, &psx)
+                judge_vram(&reference, &psx, None)
             })
         };
         match verdict {

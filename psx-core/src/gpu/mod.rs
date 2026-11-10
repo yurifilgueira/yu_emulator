@@ -29,6 +29,8 @@ const MODE_FLIP_Y: u32 = 1 << 13;
 const MODE_TPAGE_ATTRIBUTE: u32 = 0x09FF;
 /// Bits 0-13 exist.
 const MODE_WRITABLE: u32 = 0x3FFF;
+/// Bit 11, "Texture page Y Base 2": only writable after GP1(09h) allowed it.
+const MODE_Y_BASE_2: u32 = 1 << 11;
 
 // psx-spx: "GP1(08h) - Display mode".
 const DISPLAY_480: u32 = 1 << 2;
@@ -129,6 +131,8 @@ pub struct Gpu {
     display_x: u32,
     display_y: u32,
     display_mode: u32,
+    /// GP1(09h) bit 0: GP0(E1h) bit 11 may be set.
+    allow_y_base_2: bool,
     irq: bool,
     /// An IRQ1 edge the bus has not collected yet.
     irq_edge: bool,
@@ -139,6 +143,12 @@ pub struct Gpu {
     buffer: Vec<u32>,
     /// VRAM-to-CPU transfer in progress.
     store: Option<Transfer>,
+    /// psx-spx: "GPU Texture Caching" — "a CLUT cache that is preserved
+    /// between GPU drawing commands". Holds the palette last used, and which
+    /// one that was: its CLUT attribute and whether all 256 entries (8-bit
+    /// textures) or only the first 16 (4-bit) were loaded.
+    clut_cache: [u16; 256],
+    clut_cache_key: Option<(u32, bool)>,
     /// Value returned by GPUREAD outside of a transfer (GP1(10h) latch).
     read_latch: u32,
     /// GP0 words received since power-on (statistics for the harness).
@@ -175,11 +185,14 @@ impl Gpu {
             display_x: 0,
             display_y: 0,
             display_mode: 0,
+            allow_y_base_2: false,
             irq: false,
             irq_edge: false,
             state: Gp0State::Command,
             buffer: Vec::with_capacity(16),
             store: None,
+            clut_cache: [0; 256],
+            clut_cache_key: None,
             read_latch: 0,
             gp0_words: 0,
         };
@@ -203,11 +216,27 @@ impl Gpu {
         }
     }
 
-    /// psx-spx: "GP1(01h) - Reset Command Buffer".
+    /// psx-spx: "GP1(01h) - Reset Command Buffer": "Resets the command
+    /// buffer and CLUT cache."
     fn reset_command_buffer(&mut self) {
         self.state = Gp0State::Command;
         self.buffer.clear();
         self.store = None;
+        self.clut_cache_key = None;
+    }
+
+    /// Stores GP0(E1h) bits, or the tpage attribute of a textured polygon
+    /// (`mask` selects which bits the source may change).
+    fn set_draw_mode(&mut self, value: u32, mask: u32) {
+        let mut mode = (self.draw_mode & !mask) | (value & mask);
+        // psx-spx: "GP1(09h)" controls "whether or not GP0(E1h).bit11 can be
+        // used". On hardware (ps1-tests gpu/gp0-e1) the bit reads back as 0
+        // when written while not allowed; a bit set earlier stays until the
+        // next write.
+        if !self.allow_y_base_2 && mask & MODE_Y_BASE_2 != 0 {
+            mode &= !MODE_Y_BASE_2;
+        }
+        self.draw_mode = mode;
     }
 
     // ---- inspection --------------------------------------------------------
@@ -314,8 +343,11 @@ impl Gpu {
                     _ => {}
                 }
             }
-            // GP1(09h) VRAM size (only 1 MB is fitted), GP1(0Bh) unknown,
-            // and the unused numbers: ignored.
+            // "GP1(09h) - Set VRAM size (v2)". Only 1 MB is fitted, so the
+            // only visible effect is on GP0(E1h) bit 11. "GP1(09h) is NOT
+            // affected by the reset command."
+            0x09 => self.allow_y_base_2 = word & 1 != 0,
+            // GP1(0Bh) unknown, and the unused numbers: ignored.
             _ => {}
         }
     }
@@ -395,8 +427,10 @@ impl Gpu {
         let op = command >> 24;
         match op >> 5 {
             0 => match op {
-                // "Clear Cache": the texture cache is not emulated.
-                0x01 => {}
+                // "Clear Cache". psx-spx: "The CLUT cache is invalidated ...
+                // when GP0(01h) is issued." The texture cache itself is not
+                // emulated.
+                0x01 => self.clut_cache_key = None,
                 0x02 => self.fill(command, words[1], words[2]),
                 // "GP0(1Fh) - Interrupt Request (IRQ1)".
                 0x1F => {
@@ -421,7 +455,7 @@ impl Gpu {
     /// GP0(E1h..E6h). psx-spx: "GPU Rendering Attributes".
     fn set_attribute(&mut self, word: u32) {
         match word >> 24 {
-            0xE1 => self.draw_mode = word & MODE_WRITABLE,
+            0xE1 => self.set_draw_mode(word, MODE_WRITABLE),
             0xE2 => self.texture_window = word & 0xF_FFFF,
             0xE3 => {
                 // v2 GPU: 10-bit X, 10-bit Y. Only 512 lines exist.

@@ -77,10 +77,30 @@ fn draw_mode_and_mask_bits_show_in_status() {
     let mut gpu = Gpu::new();
     gpu.gp0(0xE100_07FF);
     assert_eq!(gpu.status() & 0x7FF, 0x7FF);
-    gpu.gp0(0xE100_0800); // texture page Y base 2 -> status bit 15
-    assert_ne!(gpu.status() & (1 << 15), 0);
     gpu.gp0(0xE600_0003);
     assert_eq!((gpu.status() >> 11) & 3, 3);
+}
+
+#[test]
+fn draw_mode_bit11_needs_gp1_09() {
+    // psx-spx: "GP1(09h) - Set VRAM size (v2)"; sequence and results from
+    // the console log of ps1-tests gpu/gp0-e1.
+    let mut gpu = Gpu::new();
+    let bit15 = |gpu: &Gpu| gpu.status() & (1 << 15) != 0;
+    gpu.gp0(0xE100_0800);
+    assert!(!bit15(&gpu), "ignored while not allowed");
+    gpu.gp1(0x0900_0001);
+    gpu.gp0(0xE100_0800);
+    assert!(bit15(&gpu), "written when allowed");
+    gpu.gp1(0x0900_0000);
+    assert!(bit15(&gpu), "un-allowing preserves the bit");
+    gpu.gp0(0xE100_0800);
+    assert!(!bit15(&gpu), "...until the next write");
+    // "GP1(09h) is NOT affected by the reset command."
+    gpu.gp1(0x0900_0001);
+    gpu.gp1(0x0000_0000);
+    gpu.gp0(0xE100_0800);
+    assert!(bit15(&gpu));
 }
 
 #[test]
@@ -430,6 +450,53 @@ fn clut_textures_4bit_and_8bit() {
     gpu.gp0(0xE100_0000 | (1 << 7) | PAGE); // 8-bit
     send(&mut gpu, &[0x6500_0000, xy(0, 2), clut, (1 << 16) | 2]);
     assert_eq!([pixel(&gpu, 0, 2), pixel(&gpu, 1, 2)], [0x121, 0x143]);
+}
+
+#[test]
+fn clut_cache_keeps_the_palette_until_invalidated() {
+    // psx-spx: "GPU Texture Caching": "The CLUT cache is invalidated when
+    // different CLUT index values are used or when GP0(01h) is issued."
+    let mut gpu = gpu();
+    upload(&mut gpu, 16, 300, 1, 1, &[0x0111]);
+    upload(&mut gpu, 32, 300, 1, 1, &[0x0333]);
+    upload(&mut gpu, PAGE_X, 0, 1, 1, &[0x0000]); // index 0 everywhere
+    gpu.gp0(0xE100_0000 | PAGE);
+    let clut_a = ((300 << 6) | 1) << 16;
+    let clut_b = ((300 << 6) | 2) << 16;
+    let draw = |gpu: &mut Gpu, clut: u32| {
+        send(gpu, &[0x6D00_0000, xy(0, 0), clut]); // 1x1 raw textured
+        pixel(gpu, 0, 0)
+    };
+    assert_eq!(draw(&mut gpu, clut_a), 0x0111);
+    upload(&mut gpu, 16, 300, 1, 1, &[0x0222]); // palette changes in VRAM
+    assert_eq!(draw(&mut gpu, clut_a), 0x0111, "still the cached colour");
+    gpu.gp0(0x0100_0000);
+    assert_eq!(draw(&mut gpu, clut_a), 0x0222, "GP0(01h) reloads");
+    upload(&mut gpu, 16, 300, 1, 1, &[0x0444]);
+    assert_eq!(draw(&mut gpu, clut_b), 0x0333, "another CLUT is loaded");
+    assert_eq!(draw(&mut gpu, clut_a), 0x0444, "and switching back reloads");
+}
+
+#[test]
+fn clut_cache_reloads_for_more_entries_but_not_for_fewer() {
+    // Behaviour shown by the reference image of ps1-tests gpu/clut-cache.
+    let mut gpu = gpu();
+    let clut = ((300 << 6) | 1) << 16;
+    upload(&mut gpu, PAGE_X, 0, 1, 1, &[0x0000]);
+    let draw = |gpu: &mut Gpu, depth: u32| {
+        gpu.gp0(0xE100_0000 | (depth << 7) | PAGE);
+        send(gpu, &[0x6D00_0000, xy(0, 0), clut]);
+        pixel(gpu, 0, 0)
+    };
+    upload(&mut gpu, 16, 300, 1, 1, &[0x0111]);
+    assert_eq!(draw(&mut gpu, 0), 0x0111, "4-bit: 16 entries cached");
+    upload(&mut gpu, 16, 300, 1, 1, &[0x0222]);
+    assert_eq!(draw(&mut gpu, 1), 0x0222, "8-bit needs 256 entries: reloaded");
+    upload(&mut gpu, 16, 300, 1, 1, &[0x0333]);
+    assert_eq!(draw(&mut gpu, 0), 0x0222, "back to 4-bit: cached entries are enough");
+    // 15-bit textures do not touch the cache.
+    assert_eq!(draw(&mut gpu, 2), 0x0222, "texel 0000h is transparent: pixel unchanged");
+    assert_eq!(draw(&mut gpu, 0), 0x0222);
 }
 
 #[test]
