@@ -5,6 +5,8 @@
 //! - Every hardware behaviour cites the psx-spx section it implements.
 
 pub mod bus;
+pub mod cpu;
 pub mod map;
 
 pub use bus::{BiosError, Bus, BusFault};
+pub use cpu::Cpu;
