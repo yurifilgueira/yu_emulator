@@ -20,6 +20,7 @@ use crate::dma::{self, Dma, SyncMode};
 use crate::gpu::Gpu;
 use crate::irq::{Interrupt, Irq};
 use crate::map::{self, mask_region};
+use crate::sio::Sio0;
 use crate::spu::Spu;
 use crate::timers::Timers;
 use std::collections::HashSet;
@@ -118,6 +119,8 @@ pub struct Bus {
     /// CPU cycles consumed by DMA transfers since the last `take_stall`.
     stall: u32,
     pub spu: Spu,
+    /// Controller and memory card port.
+    pub sio0: Sio0,
     /// Distinct unhandled accesses, in first-seen order.
     unhandled: Vec<UnhandledAccess>,
     unhandled_seen: HashSet<UnhandledAccess>,
@@ -147,6 +150,7 @@ impl Bus {
             dma_list_active: false,
             stall: 0,
             spu: Spu::default(),
+            sio0: Sio0::default(),
             unhandled: Vec::new(),
             unhandled_seen: HashSet::new(),
         })
@@ -174,6 +178,7 @@ impl Bus {
         if events.vblank_started {
             self.irq.request(Interrupt::Vblank);
         }
+        self.sio0.tick(cycles, &mut self.irq);
         if self.dma_list_active {
             self.dma_list_node();
         }
@@ -306,6 +311,12 @@ impl Bus {
 
     /// psx-spx: "I/O Map".
     fn io_load(&mut self, addr: u32, width: Width) -> u32 {
+        // psx-spx: "Serial Interfaces (SIO)" — SIO0 has 8- and 16-bit
+        // registers at 1F801040h..1F80104Fh.
+        if let Some(off) = map::SIO0.contains(addr) {
+            let value = self.sio0.read(off, width.bytes());
+            return value & (0xFFFF_FFFF >> (32 - 8 * width.bytes() as u32));
+        }
         let reg = addr & !3;
         let value = match reg {
             0x1F80_1000..=0x1F80_1020 => self.mem_ctrl[((reg - 0x1F80_1000) / 4) as usize],
@@ -344,6 +355,15 @@ impl Bus {
     }
 
     fn io_store(&mut self, addr: u32, width: Width, val: u32) {
+        if let Some(off) = map::SIO0.contains(addr) {
+            self.sio0.write(off, val);
+            // A 32-bit store at 1F801048h covers the mode and the control
+            // register.
+            if width == Width::Word && off == 0x8 {
+                self.sio0.write(0xA, val >> 16);
+            }
+            return;
+        }
         let reg = addr & !3;
         // psx-spx: "Caution - 8/16-bit writes to certain IO registers": a
         // narrow store to these registers "will behave like a 32-bit store,
@@ -698,12 +718,12 @@ mod tests {
     #[test]
     fn io_accesses_are_recorded_once() {
         let mut b = bus();
-        // Devices that are still stubs: controller port and SPU.
-        b.store32(0x1F80_1040, 0xB88).unwrap();
-        b.store32(0x1F80_1040, 0xB88).unwrap();
+        // Devices that are still stubs: CD-ROM and SPU voices.
+        b.store32(0x1F80_1800, 0xB88).unwrap();
+        b.store32(0x1F80_1800, 0xB88).unwrap();
         b.load16(0x1F80_1C00).unwrap(); // SPU
         assert_eq!(b.unhandled().len(), 2);
-        assert_eq!(b.unhandled()[0].addr, 0x1F80_1040);
+        assert_eq!(b.unhandled()[0].addr, 0x1F80_1800);
         assert_eq!(b.unhandled()[0].kind, AccessKind::Store);
         assert_eq!(b.unhandled()[1].addr, 0x1F80_1C00);
     }
@@ -1019,5 +1039,25 @@ mod tests {
         b.store32(0x1F80_1104, 0x100).unwrap();
         b.tick(700);
         assert_eq!(b.load32(0x1F80_1100).unwrap(), 137);
+    }
+
+    #[test]
+    fn controller_port_is_reachable_through_the_bus() {
+        use crate::sio::{button, DigitalPad};
+        let mut b = bus();
+        b.sio0.ports[0].pad = Some(DigitalPad { pressed: button::UP });
+        b.store16(0x1F80_1048, 0x000D).unwrap(); // mode
+        b.store16(0x1F80_104E, 0x0088).unwrap(); // baud
+        b.store16(0x1F80_104A, 0x1003).unwrap(); // select port 1, TX, /ACK IRQ
+        let mut replies = Vec::new();
+        for byte in [0x01u8, 0x42, 0x00, 0x00, 0x00] {
+            b.store8(0x1F80_1040, byte).unwrap();
+            b.tick(2000);
+            assert_ne!(b.load16(0x1F80_1044).unwrap() & 2, 0, "RX ready");
+            replies.push(b.load8(0x1F80_1040).unwrap());
+        }
+        assert_eq!(replies, [0xFF, 0x41, 0x5A, 0xEF, 0xFF]);
+        assert_ne!(b.irq.stat() & (1 << 7), 0, "IRQ7 from /ACK");
+        assert!(b.unhandled().is_empty());
     }
 }
