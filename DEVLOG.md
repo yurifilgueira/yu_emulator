@@ -17,6 +17,116 @@ Model: claude-fable-5-2 · Session time: Xh · Human interventions: N
 
 ---
 
+## 2026-11-10 — Phase 3: GPU, window frontend, first pull request
+
+Model: claude-fable-5-2 · Session time: ~2h (estimate, not measured) · Human interventions: 1
+
+- Done (branch `phase-3-gpu`, not on `main`):
+  - `psx-core/src/gpu/`: 1024x512 VRAM, every GP0 command (fill, the three
+    VRAM transfers, polygons, rectangles, lines and polylines, attributes
+    E1h-E6h, IRQ), every GP1 command, GPUSTAT, GPUREAD, the displayed
+    picture in 15 and 24 bit. Software rasteriser with flat/Gouraud/
+    textured (4/8/15-bit) drawing, modulation, dithering, texture windows,
+    four semi-transparency modes, mask set/check, CLUT cache, interlaced
+    drawing.
+  - `video.rs` now belongs to the GPU and follows its registers: NTSC/PAL
+    frame sizes, hblank from GP1(06h), vblank from GP1(07h).
+  - `psx-core/src/spu.rs`: register file plus sound RAM transfers (manual
+    and DMA4). No sound. Pulled forward from Phase 7 because the BIOS shell
+    uploads samples before it draws.
+  - Harness: `vram-hash`, `--vram-out`, `--frame-out`, `--diff-out`,
+    `--region`; `suite` also judges programs that ship a `vram.png`. Uses
+    the `png` crate.
+  - `frontend/` crate (binary `yu-emulator`, `minifb` window): display or
+    whole VRAM, Tab to switch.
+  - 171 unit tests (161 core, 7 harness, 3 frontend).
+  - CLAUDE.md "Git and GitHub" rewritten for the pull-request workflow the
+    owner asked for, and its staging rule tightened after my mistake below.
+- Results (OpenBIOS):
+  - `harness suite bios/openbios.bin tests/ps1-tests`: 15 of 32 pass (was
+    3 of 21 before image tests were counted). GPU programs: `clipping`,
+    `clut-cache`, `quad`, `rectangles`, `texture-flip`, `texture-overflow`,
+    `triangle`, `uv-interpolation`, `vram-to-vram-overlap` match all
+    524,288 VRAM pixels; `gp0-e1` 10/10 and `mask-bit` 5/5 against logs.
+  - `transparency` FAILS as a whole-VRAM comparison but matches all 76,800
+    pixels of the 320x240 area it draws (`--region 0,0,320,240`); the rest
+    of the reference is white, i.e. VRAM the program never writes.
+  - `lines` FAILS by 64 pixels: two polyline segments whose end colour the
+    test never sets (its source calls `setRGB2` twice and never `setRGB3`),
+    so they show whatever was on the stack.
+  - `bandwidth` fails: it measures GPU speed and drawing takes no time here.
+  - amidog `psxtest_cpu`: all tests green in the Exception, Flag and Value
+    columns, Timing N/A everywhere. **I read this off a screenshot by eye**;
+    nothing checks it mechanically. VRAM hash of that run:
+    `91bcaf744e265cac` (300M cycles), usable as a regression marker.
+  - amidog `psxtest_cpx`: draws its menu and waits for START. Needs a
+    controller; moved to Phase 5's acceptance.
+  - BIOS shell: OpenBIOS's rotating cube renders at 640x480 interlaced.
+    The roadmap's "memory card / CD player menu" is Sony's shell, which I
+    cannot run.
+- Broke / surprised us:
+  - **A stray file was committed and pushed.** `lines_main.c` (ps1-tests
+    source I had downloaded to read) ended up in the repository root: a
+    `cd` into a scratch directory that did not exist yet failed, `curl -o`
+    wrote into the current directory instead, and I then committed with
+    `git add -A` without reading the staged list that I had printed in the
+    same command. Removed by a follow-up commit (`1ae6cea`); the history
+    was not rewritten, so the file is still visible in commit `ee9d7ef`.
+  - The interlaced BIOS picture was wrong twice. First the cube was
+    striped: fills cleared every line while polygons skipped the displayed
+    field. After making fills skip too, one field was entirely black. A
+    temporary log of each fill showed the shell draws twice per two
+    frames, both times while my field flag had the same value: I switched
+    fields at vsync, but the field being scanned out has to switch when
+    vblank starts. psx-spx says only that interlace "DOES affect GP0 draw
+    commands"; the rule in the code is inferred from this one program.
+  - The CLUT cache had one case wrong: going from 8-bit to 4-bit textures
+    with the same CLUT must keep the cached palette (I reloaded it).
+    Found by `gpu/clut-cache`, fixed, and then a unit test I added for it
+    had a wrong expectation of my own (a transparent texel leaves the
+    old pixel, not zero).
+  - `gpu/gp0-e1` showed GP0(E1h) bit 11 is only stored after GP1(09h)
+    allows it. psx-spx hints at it; the exact behaviour comes from the log.
+  - The BIOS shell never reached the GPU: it waited for a DMA transfer to
+    the SPU, which Phase 2 left pending forever "as if DREQ never came".
+  - Correction to the Phase 2 entry: amidog's programs do print on the TTY
+    once they get past the GPU ("Running add test / Done", and a final
+    "Result: 00000101" whose meaning I do not know). The per-test verdicts
+    are still only on screen.
+  - The Phase 2 unit tests of `video.rs` were replaced, not kept: they
+    tested the placeholder blanking positions, which no longer exist now
+    that blanking follows the GPU registers.
+  - It is slow. The window ran 120 frames in 6.4 s (about 19 per second,
+    a third of real time). Headless, 68M cycles of BIOS boot take 8.0 s
+    here against 5.9 s for the Phase 2 code on the same machine, so most
+    of the cost predates the GPU: every device is ticked after every
+    instruction. No profiler is installed and I did not optimise (rule 8).
+  - 38 of 38 new GPU unit tests and 9 of 14 GPU test programs passed on
+    the first run. That is not evidence the unit tests are strong: they
+    check rules stated by psx-spx, while the pixel-exact results depend on
+    fixed-point stepping that psx-spx does not specify and that I
+    reproduced from memory of how other software renderers do it
+    (`raster.rs` says so). The reference images are the real check.
+- How it was found and fixed: reference images and logs for everything in
+  the GPU; looking at dumped PNGs for the interlace bugs; a throwaway
+  debug print (removed) for the field timing.
+- Human stepped in for: asking that work go through pull requests instead
+  of straight to `main`. The GitHub CLI is not installed on this machine,
+  so I could push the branch but not open the pull request myself.
+- Known gaps and deviations (commented in the code):
+  - No command FIFO, no drawing time: GPUSTAT busy bits only reflect a
+    command waiting for parameters; DMA2 does not check GP1(04h).
+  - Texture cache not emulated (CLUT cache is).
+  - Texture page Y base 2 / 2 MB VRAM ignored apart from the status bit.
+  - Hblank/vblank as seen by timers are derived from the display range
+    registers; psx-spx does not define them. The timers sync-mode tables
+    still differ from the console log.
+  - The frontend applies no 4:3 correction, has no input and no speed
+    regulation.
+  - SPU: transfers only; the busy flag never reads busy.
+- Next: Phase 4, the GTE (the OpenBIOS cube already executes 64 COP2
+  instructions that are ignored, and ps1-tests has `gte/test-all`).
+
 ## 2026-11-09 — Phase 2: PS-EXE sideload, interrupts, timers, DMA
 
 Model: claude-fable-5-2 · Session time: ~1.5h (estimate, not measured) · Human interventions: 0
