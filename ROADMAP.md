@@ -1,11 +1,13 @@
-# Roadmap
+# Yu-Emulator roadmap
+
+PlayStation first, then Game Boy.
 
 Each phase lists its **acceptance criteria**. A phase is done only when all of
 them pass and are recorded in `DEVLOG.md`.
 
 ## Phase 0 — Bus and memory map ✅
 
-- [x] Workspace: `core` (no I/O) + `harness`
+- [x] Workspace: `psx-core` (no I/O) + `harness`
 - [x] Segment masking (KUSEG / KSEG0 / KSEG1 / KSEG2)
 - [x] RAM 2 MB mirrored over 8 MB, BIOS 512 KB read-only, scratchpad
       (not reachable via KSEG1), expansion 1 open bus, cache control
@@ -66,3 +68,14 @@ them pass and are recorded in `DEVLOG.md`.
 
 - [ ] `COMPATIBILITY.md` table: boots / playable / perfect
 - [ ] Full speed on a mid-range laptop
+
+---
+
+# Game Boy (after the PS1)
+
+Starts once PS1 Phase 6 is done (a commercial 3D game is playable).
+
+- [ ] `gb-core/` crate: SM83 CPU, memory map and MBCs, PPU, APU, timers, joypad
+- [ ] Frontend supports choosing the system
+- **Accept:** Blargg's `cpu_instrs` and `instr_timing` pass; Mooneye
+  acceptance tests tracked in a table; a commercial game is playable.

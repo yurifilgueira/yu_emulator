@@ -1,12 +1,13 @@
-# psx — a PlayStation emulator built with Claude Fable 5.2
+# Yu-Emulator
 
-A PS1 emulator written in Rust as a public experiment: how far can an AI model
+A multi-system emulator built with Claude Fable 5.2: PlayStation (PS1) first,
+Game Boy next. Written in Rust as a public experiment: how far can an AI model
 take a long, hard, objectively testable engineering project?
 
 Everything is recorded: the git history, `DEVLOG.md` (including the model's
 mistakes) and the roadmap with acceptance criteria for each phase.
 
-## Status
+## Status — PlayStation
 
 | Subsystem        | Status | Tests |
 |------------------|--------|-------|
@@ -19,7 +20,7 @@ mistakes) and the roadmap with acceptance criteria for each phase.
 | CD-ROM           | ⏳     | —     |
 | SPU / MDEC       | ⏳     | —     |
 
-See `ROADMAP.md` for the plan.
+Game Boy support is planned after the PS1 (see `ROADMAP.md`).
 
 ## Running
 

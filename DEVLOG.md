@@ -17,6 +17,13 @@ Model: claude-fable-5-2 · Session time: Xh · Human interventions: N
 
 ---
 
+## 2026-11-10 — Project renamed to Yu-Emulator
+
+Human interventions: 0
+- Done: project renamed to Yu-Emulator (PS1 first, Game Boy later). Core
+  crate moved to `psx-core/` to leave room for `gb-core/`. CLAUDE.md now
+  requires pushing to the owner's GitHub repo after every green commit.
+
 ## 2026-11-10 — Phase 0: bus and memory map
 
 Model: scaffold generated before the Fable sessions start · Human interventions: 0
