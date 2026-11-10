@@ -1,4 +1,5 @@
-//! MIPS R3000A interpreter (the PS1 CPU, without the GTE).
+//! MIPS R3000A interpreter (the PS1 CPU). Coprocessor 2, the GTE, is in
+//! `gte.rs`; this file only decodes its instructions.
 //!
 //! psx-spx: "CPU Specifications"
 //!
@@ -18,6 +19,7 @@
 //!   after the following instruction has read its operands.
 
 use crate::bus::{Bus, Width};
+use crate::gte::Gte;
 use crate::map;
 
 /// psx-spx: "COP0 - Exception Handling" — ExcCode values of CAUSE.
@@ -153,7 +155,8 @@ pub struct Cpu {
 
     last_instr: u32,
     cycles: u64,
-    gte_unimplemented: u64,
+    /// Coprocessor 2.
+    pub gte: Gte,
 }
 
 impl Default for Cpu {
@@ -184,7 +187,7 @@ impl Cpu {
             cop_number: 0,
             last_instr: 0,
             cycles: 0,
-            gte_unimplemented: 0,
+            gte: Gte::default(),
         };
         cpu.reset();
         cpu
@@ -268,12 +271,6 @@ impl Cpu {
         self.cycles
     }
 
-    /// Number of COP2 (GTE) instructions executed as no-ops. The GTE is
-    /// Phase 4; this lets the harness report that software needed it.
-    pub fn gte_unimplemented(&self) -> u64 {
-        self.gte_unimplemented
-    }
-
     /// Drives the CPU's external interrupt line.
     /// psx-spx: "cop0r13 - CAUSE" bits 10-15 (IP). On the PS1 the interrupt
     /// controller (I_STAT & I_MASK, Phase 2) is wired to bit 10.
@@ -343,9 +340,15 @@ impl Cpu {
 
         // psx-spx: "cop0r13 - CAUSE" / "cop0r12 - SR": an interrupt is taken
         // when IEc is set and any pending bit (IP/Sw) is enabled in Im.
-        // Phase 4 note: psx-spx "Interrupts vs GTE Commands" (the GTE command
-        // at EPC still executes) must be handled here once the GTE exists.
         if self.cop0.sr & SR_IEC != 0 && self.cop0.sr & self.cop0.cause & CAUSE_IP != 0 {
+            // psx-spx: "Interrupts vs GTE Commands" — "If an interrupt
+            // occurs 'on' a GTE command (cop2cmd), then the GTE command is
+            // executed, but nethertheless, the return address in EPC points
+            // to the GTE command." The handler is expected to skip it,
+            // recognising it by "([epc] AND FE000000h)=4A000000h".
+            if word & 0xFE00_0000 == 0x4A00_0000 && self.cop0.sr & (SR_CU0 << 2) != 0 {
+                self.gte.execute(word);
+            }
             return Err(Exception::Interrupt);
         }
 
@@ -630,18 +633,16 @@ impl Cpu {
             // kernel mode — and otherwise does nothing visible. Whether a
             // memory access happens in that case is unknown; none is made.
             0x30 | 0x31 | 0x33 | 0x38 | 0x39 | 0x3B => self.require_cop(i.op() & 3)?,
+            // psx-spx: "CPU Coprocessor Opcodes" — "lwc# rt,imm(rs)
+            // ;cop#dat_rt = [rs+imm]" and "swc#": GTE data registers only.
             0x32 => {
-                // LWC2: GTE data register load. GTE is Phase 4; the memory
-                // access (and its exceptions) still happens.
                 self.require_cop(2)?;
-                self.load32(bus, addr)?;
-                self.gte_unimplemented += 1;
+                let value = self.load32(bus, addr)?;
+                self.gte.write(i.rt(), value);
             }
             0x3A => {
-                // SWC2: stores a GTE data register (reads as zero for now).
                 self.require_cop(2)?;
-                self.store(bus, addr, Width::Word, 0)?;
-                self.gte_unimplemented += 1;
+                self.store(bus, addr, Width::Word, self.gte.read(i.rt()))?;
             }
 
             // psx-spx: "Illegal Opcodes" — all N/A opcodes raise RI.
@@ -829,15 +830,32 @@ impl Cpu {
         Ok(())
     }
 
-    /// COP2 is the GTE (Phase 4). Until then commands and register writes do
-    /// nothing and register reads return zero, and each use is counted so
-    /// the harness can report it.
+    /// COP2, the GTE. psx-spx: "Coprocessor Opcode/Parameter Encoding",
+    /// "GTE Operation".
     fn execute_cop2(&mut self, i: Instr) -> Result<(), Exception> {
         self.require_cop(2)?;
-        self.gte_unimplemented += 1;
-        if matches!(i.rs(), 0x00 | 0x02) {
-            // MFC2/CFC2 have a load delay like memory loads.
-            self.load_delayed(i.rt(), 0);
+        // Bit 25 set: "COPn imm25", a GTE command.
+        if i.0 & (1 << 25) != 0 {
+            self.gte.execute(i.0);
+            return Ok(());
+        }
+        match i.rs() {
+            // MFC2/CFC2: data registers are 0-31, control registers 32-63.
+            // psx-spx: "GTE Load Delay Slots" — "Using CFC2/MFC2 has a delay
+            // of 1 instruction until the GPR is loaded with its new value."
+            0x00 => self.load_delayed(i.rt(), self.gte.read(i.rd())),
+            0x02 => self.load_delayed(i.rt(), self.gte.read(32 + i.rd())),
+            // MTC2/CTC2. Deviation: psx-spx "Caution - Store Delay" says
+            // writes to cop2 registers take 2-3 cycles to arrive; here
+            // they are immediate.
+            0x04 => self.gte.write(i.rd(), self.regs[i.rt()]),
+            0x06 => self.gte.write(32 + i.rd(), self.regs[i.rt()]),
+            // BC2F/BC2T. psx-spx: "jt cop2flg,dest ;-jump never",
+            // "jf cop2flg,dest ;-jump always" — "implemented (no exception),
+            // but, flag seems to be always 'false'".
+            0x08 => self.branch(i.0 & (1 << 16) == 0, i.simm()),
+            // Other encodings raise nothing (ps1-tests cpu/cop).
+            _ => {}
         }
         Ok(())
     }
@@ -1567,12 +1585,109 @@ mod tests {
             assert_eq!(m.cpu.pc(), BASE + 4, "instr 0x{instr:08X}");
         }
 
-        // COP2 enabled: no exception (GTE itself is Phase 4).
+        // COP2 enabled: no exception.
         let mut m = Machine::new(&[0x4A00_0001]);
         m.cpu.cop0.sr = SR_CU0 << 2;
         m.steps(1);
         assert_eq!(m.cpu.pc(), BASE + 4);
-        assert_eq!(m.cpu.gte_unimplemented(), 1);
+    }
+
+    // ---- GTE instructions --------------------------------------------------
+
+    const CU2: u32 = SR_CU0 << 2;
+    fn mtc2(rt: u32, rd: u32) -> u32 {
+        (0x12 << 26) | (0x04 << 21) | (rt << 16) | (rd << 11)
+    }
+    fn ctc2(rt: u32, rd: u32) -> u32 {
+        (0x12 << 26) | (0x06 << 21) | (rt << 16) | (rd << 11)
+    }
+    fn mfc2(rt: u32, rd: u32) -> u32 {
+        (0x12 << 26) | (rt << 16) | (rd << 11)
+    }
+    fn cfc2(rt: u32, rd: u32) -> u32 {
+        (0x12 << 26) | (0x02 << 21) | (rt << 16) | (rd << 11)
+    }
+
+    #[test]
+    fn gte_register_moves_and_load_delay() {
+        // psx-spx: "GTE Load Delay Slots".
+        let mut m = Machine::new(&[
+            mtc2(1, 9),              // IR1 = r1
+            ctc2(1, 26),             // H = r1
+            mfc2(2, 9),              // r2 = IR1 (sign-extended 16 bit)
+            rtype(0x21, 2, 0, 3, 0), // r3 = r2: still the old value
+            cfc2(4, 26),             // r4 = H (sign-extension bug)
+            NOP,
+        ]);
+        m.cpu.cop0.sr = CU2;
+        m.cpu.set_reg(1, 0x1234_8765);
+        m.cpu.set_reg(2, 0xAAAA);
+        m.steps(6);
+        assert_eq!(m.cpu.reg(2), 0xFFFF_8765);
+        assert_eq!(m.cpu.reg(3), 0xAAAA);
+        assert_eq!(m.cpu.reg(4), 0xFFFF_8765);
+    }
+
+    #[test]
+    fn gte_command_runs_through_the_cpu() {
+        // NCLIP on a triangle written through MTC2: MAC0 = 100.
+        let [a, b] = li(1, 0x0000_000A); // (10, 0)
+        let [c, d] = li(2, 0x000A_0000); // (0, 10)
+        let mut m = Machine::new(&[a, b, c, d, mtc2(0, 12), mtc2(1, 13), mtc2(2, 14), 0x4B40_0006, mfc2(3, 24), NOP]);
+        m.cpu.cop0.sr = CU2;
+        m.steps(10);
+        assert_eq!(m.cpu.reg(3), 100);
+    }
+
+    #[test]
+    fn lwc2_and_swc2_move_data_registers() {
+        let mut m = with_data(0x0064_00C8, &[itype(0x32, 1, 0, 0), itype(0x3A, 1, 0, 4), itype(0x32, 1, 1, 2)]);
+        m.cpu.cop0.sr = CU2;
+        m.steps(2);
+        assert_eq!(m.cpu.gte.read(0), 0x0064_00C8, "VXY0 loaded");
+        assert_eq!(m.bus.load32(DATA + 4).unwrap(), 0x0064_00C8, "and stored back");
+        // A misaligned LWC2 faults and leaves the register alone.
+        m.steps(1);
+        m.assert_exception(Exception::AddressLoad, BASE + 8);
+        assert_eq!(m.cpu.gte.read(1), 0);
+    }
+
+    #[test]
+    fn bc2f_always_branches_and_bc2t_never() {
+        // psx-spx: "GTE Operation" — "jt cop2flg ;-jump never",
+        // "jf cop2flg ;-jump always".
+        let bc2f = (0x12 << 26) | (0x08 << 21) | 2;
+        let bc2t = bc2f | (1 << 16);
+        let mut m = Machine::new(&[bc2f, NOP]);
+        m.cpu.cop0.sr = CU2;
+        m.steps(2);
+        assert_eq!(m.cpu.pc(), BASE + 4 + 8);
+        let mut m = Machine::new(&[bc2t, NOP]);
+        m.cpu.cop0.sr = CU2;
+        m.steps(2);
+        assert_eq!(m.cpu.pc(), BASE + 8);
+    }
+
+    #[test]
+    fn interrupted_gte_command_still_executes() {
+        // psx-spx: "Interrupts vs GTE Commands".
+        let mut m = Machine::new(&[0x4B40_0006]); // NCLIP
+        m.cpu.gte.write(12, 0x0000_0000);
+        m.cpu.gte.write(13, 0x0000_000A);
+        m.cpu.gte.write(14, 0x000A_0000);
+        m.cpu.cop0.sr = CU2 | 0x0401;
+        m.cpu.set_irq(true);
+        m.steps(1);
+        m.assert_exception(Exception::Interrupt, BASE);
+        assert_eq!(m.cpu.gte.read(24), 100, "the command ran although EPC points at it");
+
+        // Any other instruction is not executed when interrupted.
+        let mut m = Machine::new(&[mtc2(1, 9)]);
+        m.cpu.set_reg(1, 55);
+        m.cpu.cop0.sr = CU2 | 0x0401;
+        m.cpu.set_irq(true);
+        m.steps(1);
+        assert_eq!(m.cpu.gte.read(9), 0);
     }
 
     #[test]
