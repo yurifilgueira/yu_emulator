@@ -39,7 +39,7 @@ fn cmd_bios(path: &str) -> ExitCode {
         }
     };
 
-    let first = bus.load32(map::RESET_VECTOR);
+    let first = bus.load32(map::RESET_VECTOR).expect("BIOS is always mapped");
     println!("OK    BIOS loaded ({} KB)", map::BIOS_SIZE / 1024);
     println!("      reset vector 0x{:08X} -> 0x{first:08X}", map::RESET_VECTOR);
 

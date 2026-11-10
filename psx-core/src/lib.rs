@@ -7,4 +7,4 @@
 pub mod bus;
 pub mod map;
 
-pub use bus::{Bus, BiosError};
+pub use bus::{BiosError, Bus, BusFault};
