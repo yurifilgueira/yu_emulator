@@ -3,8 +3,8 @@
 //! psx-spx: "Memory Map"
 //!
 //! RAM, BIOS, scratchpad and expansion regions are real, and so are the
-//! memory control registers, the interrupt controller, the timers and the
-//! DMA controller. Every other I/O port is stubbed: reads return 0, writes
+//! memory control registers, the interrupt controller, the timers, the DMA
+//! controller and the GPU. Every other I/O port is stubbed: reads return 0, writes
 //! are dropped, and the access is recorded in `Bus::unhandled` so the
 //! harness can show exactly which device needs implementing next.
 //!
@@ -17,10 +17,10 @@
 //! 0x1F80_1000-0x1F80_2FFF and expansion 2 are treated as mapped stubs.
 
 use crate::dma::{self, Dma, SyncMode};
+use crate::gpu::Gpu;
 use crate::irq::{Interrupt, Irq};
 use crate::map::{self, mask_region};
 use crate::timers::Timers;
-use crate::video::Video;
 use std::collections::HashSet;
 use std::fmt;
 
@@ -111,15 +111,13 @@ pub struct Bus {
     pub irq: Irq,
     timers: Timers,
     dma: Dma,
-    video: Video,
+    pub gpu: Gpu,
     /// A GPU linked-list DMA is in progress (one node per `tick`).
     dma_list_active: bool,
     /// CPU cycles consumed by DMA transfers since the last `take_stall`.
     stall: u32,
     /// SPU stub (Phase 7): the register file as plain memory.
     spu_regs: Box<[u8]>,
-    /// Words sent to GP0 while the GPU is still a stub (Phase 3).
-    gp0_words: u64,
     /// Distinct unhandled accesses, in first-seen order.
     unhandled: Vec<UnhandledAccess>,
     unhandled_seen: HashSet<UnhandledAccess>,
@@ -145,11 +143,10 @@ impl Bus {
             irq: Irq::default(),
             timers: Timers::default(),
             dma: Dma::default(),
-            video: Video::default(),
+            gpu: Gpu::new(),
             dma_list_active: false,
             stall: 0,
             spu_regs: vec![0; map::SPU.length as usize].into_boxed_slice(),
-            gp0_words: 0,
             unhandled: Vec::new(),
             unhandled_seen: HashSet::new(),
         })
@@ -164,14 +161,14 @@ impl Bus {
         self.cache_control
     }
 
-    /// Words written to GP0 (directly or by DMA) and dropped by the GPU stub.
+    /// Words written to GP0, directly or by DMA.
     pub fn gp0_words(&self) -> u64 {
-        self.gp0_words
+        self.gpu.gp0_words()
     }
 
     /// Advances the hardware clocked by the system clock by `cycles`.
     pub fn tick(&mut self, cycles: u32) {
-        let events = self.video.tick(cycles);
+        let events = self.gpu.video.tick(cycles);
         self.timers.tick(cycles, &events, &mut self.irq);
         // psx-spx: "Interrupts" — IRQ0 VBLANK.
         if events.vblank_started {
@@ -317,14 +314,9 @@ impl Bus {
             0x1F80_1074 => self.irq.mask(),
             0x1F80_1080..=0x1F80_10FF => self.dma.read(reg - 0x1F80_1080),
             0x1F80_1100..=0x1F80_112F => self.timers.read(reg - 0x1F80_1100),
-            0x1F80_1814 => {
-                // GPU stub (Phase 3). psx-spx: "1F801814h - GPUSTAT": report
-                // the reset value seen on hardware (14802000h: display
-                // disabled, ready for commands, FIFO empty) so software
-                // waiting for the GPU to become idle does not hang.
-                self.record(Region::Io, AccessKind::Load, width, addr);
-                0x1480_2000
-            }
+            // psx-spx: "GPU I/O Ports" — GPUREAD and GPUSTAT.
+            0x1F80_1810 => self.gpu.read(),
+            0x1F80_1814 => self.gpu.status(),
             _ => {
                 self.record(Region::Io, AccessKind::Load, width, addr);
                 if let Some(off) = map::SPU.contains(addr) {
@@ -376,7 +368,7 @@ impl Bus {
             }
             0x1F80_1100..=0x1F80_112F => self.timers.write(reg - 0x1F80_1100, value),
             0x1F80_1810 => self.gp0(value),
-            0x1F80_1814 => self.gp1(value),
+            0x1F80_1814 => self.gpu.gp1(value),
             _ => {
                 self.record(Region::Io, AccessKind::Store, width, addr);
                 if let Some(off) = map::SPU.contains(addr) {
@@ -384,18 +376,6 @@ impl Bus {
                 }
             }
         }
-    }
-
-    /// GPU stub (Phase 3): only the commands that change the dot clock seen
-    /// by timer 0 are interpreted.
-    /// psx-spx: "GP1(00h) - Reset GPU", "GP1(08h) - Display mode".
-    fn gp1(&mut self, word: u32) {
-        match word >> 24 {
-            0x00 => self.video.set_display_mode(0),
-            0x08 => self.video.set_display_mode(word),
-            _ => {}
-        }
-        self.record(Region::Io, AccessKind::Store, Width::Word, 0x1F80_1814);
     }
 
     // SPU stub (Phase 7). psx-spx: "SPU I/O Port Summary". The registers
@@ -430,10 +410,13 @@ impl Bus {
         write_le(&mut self.spu_regs, off, width, val);
     }
 
-    /// GPU stub (Phase 3): command words are counted and dropped.
-    fn gp0(&mut self, _word: u32) {
-        self.gp0_words += 1;
-        self.record(Region::Io, AccessKind::Store, Width::Word, 0x1F80_1810);
+    /// Sends a word to GP0 and forwards a GP0(1Fh) interrupt request.
+    /// psx-spx: "Interrupts" — IRQ1 GPU.
+    fn gp0(&mut self, word: u32) {
+        self.gpu.gp0(word);
+        if self.gpu.take_irq() {
+            self.irq.request(Interrupt::Gpu);
+        }
     }
 
     // ---- DMA transfers ---------------------------------------------------
@@ -454,7 +437,9 @@ impl Bus {
                 continue;
             }
             // DREQ: the OTC channel has none, so it only starts when forced.
-            // The GPU stub always requests data. No other device exists yet.
+            // The GPU executes commands instantly, so it is always ready
+            // for data (deviation: GP1(04h) "DMA Direction" is not checked).
+            // No other device exists yet.
             let dreq = n == dma::CHANNEL_GPU;
             if !(channel.forced() || dreq) {
                 continue;
@@ -544,8 +529,9 @@ impl Bus {
                     None => in_ram = false,
                 }
             } else {
-                // GPUREAD: the GPU stub returns zero.
-                in_ram &= self.dma_write(addr, 0);
+                // "DMA2 is equivalent to accessing Port 1F801810h".
+                let word = self.gpu.read();
+                in_ram &= self.dma_write(addr, word);
             }
             addr = addr.wrapping_add(channel.step()) & 0x00FF_FFFC;
         }
@@ -994,6 +980,35 @@ mod tests {
         assert_eq!(b.load16(0x1FA0_0000).unwrap(), 0xFFFF);
         b.store32(0x1FA0_0000, 1).unwrap();
         b.store8(0x1F80_2041, 1).unwrap(); // POST
+    }
+
+    #[test]
+    fn gpu_ports_reach_the_gpu() {
+        let mut b = bus();
+        assert_eq!(b.load32(0x1F80_1814).unwrap() & 0x7FFF_FFFF, 0x1480_2000);
+        // Fill 16x1 at (0,0) with white, then read it back through GPUREAD.
+        for word in [0x02FF_FFFF, 0, (1 << 16) | 16, 0xC000_0000, 0, (1 << 16) | 2] {
+            b.store32(0x1F80_1810, word).unwrap();
+        }
+        assert_eq!(b.load32(0x1F80_1810).unwrap(), 0x7FFF_7FFF);
+        assert!(b.unhandled().is_empty(), "the GPU is no longer a stub");
+        // GP0(1Fh) raises IRQ1.
+        b.store32(0x1F80_1810, 0x1F00_0000).unwrap();
+        assert_eq!(b.irq.stat(), 1 << 1);
+    }
+
+    #[test]
+    fn dma_reads_vram_through_gpuread() {
+        let mut b = bus();
+        for word in [0x02FF_FFFF, 0, (1 << 16) | 16, 0xC000_0000, 0, (1 << 16) | 4] {
+            b.store32(0x1F80_1810, word).unwrap();
+        }
+        b.store32(DPCR, 0x0765_4B21).unwrap();
+        b.store32(0x1F80_10A0, 0x5000).unwrap();
+        b.store32(0x1F80_10A4, (1 << 16) | 2).unwrap();
+        b.store32(0x1F80_10A8, 0x0100_0200).unwrap(); // device to RAM
+        assert_eq!(b.load32(0x5000).unwrap(), 0x7FFF_7FFF);
+        assert_eq!(b.load32(0x5004).unwrap(), 0x7FFF_7FFF);
     }
 
     #[test]
