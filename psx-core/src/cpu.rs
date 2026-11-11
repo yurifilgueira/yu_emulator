@@ -69,6 +69,28 @@ const PRID: u32 = 0x0000_0002;
 /// psx-spx: "Exception Vectors (depending on BEV bit in SR register)".
 const VECTOR_GENERAL_RAM: u32 = 0x8000_0080;
 const VECTOR_GENERAL_ROM: u32 = 0xBFC0_0180;
+/// "COP0 Break 80000040h / BFC00140h (Debug Break)".
+const VECTOR_BREAK_RAM: u32 = 0x8000_0040;
+const VECTOR_BREAK_ROM: u32 = 0xBFC0_0140;
+
+// psx-spx: "cop0r7 - DCIC - Debug and Cache Invalidate Control".
+const DCIC_ANY: u32 = 1 << 0;
+const DCIC_PC: u32 = 1 << 1;
+const DCIC_DATA: u32 = 1 << 2;
+const DCIC_READ: u32 = 1 << 3;
+const DCIC_WRITE: u32 = 1 << 4;
+const DCIC_ENABLE: u32 = 1 << 23;
+const DCIC_PC_ENABLE: u32 = 1 << 24;
+const DCIC_DATA_ENABLE: u32 = 1 << 25;
+const DCIC_READ_ENABLE: u32 = 1 << 26;
+const DCIC_WRITE_ENABLE: u32 = 1 << 27;
+/// Matches at addresses 80000000h and up (see `Cpu::breakpoint`).
+const DCIC_KERNEL: u32 = 1 << 29;
+/// Matches at addresses below 80000000h.
+const DCIC_USER: u32 = 1 << 30;
+const DCIC_TRAP: u32 = 1 << 31;
+/// Bits 6-11 and 16-22 are "Not used / Always zero".
+const DCIC_WRITE_MASK: u32 = 0xFF80_F03F;
 
 /// System control coprocessor state.
 /// psx-spx: "COP0 - Register Summary".
@@ -146,12 +168,17 @@ pub struct Cpu {
     /// The instruction being executed is a branch/jump (taken or not).
     branch: bool,
     branch_taken: bool,
-    branch_target: u32,
     /// The instruction being executed sits in a branch delay slot.
     delay_slot: bool,
     delay_taken: bool,
-    /// Coprocessor number for the CE field of a CpU exception.
-    cop_number: u32,
+    /// Bits 26-27 of the instruction being executed, for the CE field of
+    /// CAUSE (zero while no instruction has been fetched).
+    opcode_cop: u32,
+    /// SR as it was when the previous instruction started: what the
+    /// interrupt logic sees (see `fetch_and_execute`).
+    sr_seen: u32,
+    /// The exception being raised is a COP0 breakpoint (debug vector).
+    debug_break: bool,
 
     last_instr: u32,
     cycles: u64,
@@ -181,10 +208,11 @@ impl Cpu {
             writeback: None,
             branch: false,
             branch_taken: false,
-            branch_target: 0,
             delay_slot: false,
             delay_taken: false,
-            cop_number: 0,
+            opcode_cop: 0,
+            sr_seen: 0,
+            debug_break: false,
             last_instr: 0,
             cycles: 0,
             gte: Gte::default(),
@@ -201,6 +229,7 @@ impl Cpu {
     pub fn reset(&mut self) {
         self.set_pc(map::RESET_VECTOR);
         self.cop0.sr = SR_BEV;
+        self.sr_seen = SR_BEV;
         self.cop0.cause = 0;
         self.load = None;
         self.delayed = None;
@@ -321,12 +350,25 @@ impl Cpu {
     }
 
     fn fetch_and_execute(&mut self, pc: u32, bus: &mut Bus) -> Result<(), Exception> {
+        self.opcode_cop = 0;
         // psx-spx: "CPU Jump Opcodes" — a jump to an unaligned address raises
         // AdEL on the next fetch; "cop0r14 - EPC": EPC and BadVaddr point to
         // the faulty address, not to the jump.
+        // psx-spx: "COP0 - Debug Registers" — the program counter
+        // breakpoint. Its place among the fetch faults is not in psx-spx;
+        // amidog psxtest_cpx shows that an address error is raised in
+        // preference to it (pc_1_x) and that it is raised in preference to
+        // a bus error (pc_c_x: a breakpoint on an unmapped PC breaks). The
+        // match itself (the DCIC status bits) is evaluated first, as for
+        // data breakpoints.
+        let breaks = self.breakpoint(DCIC_PC_ENABLE, DCIC_PC, pc, self.cop0.bpc, self.cop0.bpcm);
         if pc & 3 != 0 || self.kseg_violation(pc) {
+            self.debug_break = false;
             self.cop0.badvaddr = pc;
             return Err(Exception::AddressLoad);
+        }
+        if breaks {
+            return Err(Exception::Break);
         }
         // psx-spx: "Memory Map" / "Scratchpad": "the scratchpad is NOT
         // executable. Attempts to jump to this region will cause a bus error
@@ -337,10 +379,19 @@ impl Cpu {
         // Unused regions bus-error on fetch as well.
         let word = bus.load32(pc).map_err(|_| Exception::BusFetch)?;
         self.last_instr = word;
+        self.opcode_cop = (word >> 26) & 3;
 
         // psx-spx: "cop0r13 - CAUSE" / "cop0r12 - SR": an interrupt is taken
         // when IEc is set and any pending bit (IP/Sw) is enabled in Im.
-        if self.cop0.sr & SR_IEC != 0 && self.cop0.sr & self.cop0.cause & CAUSE_IP != 0 {
+        //
+        // Not in psx-spx: a change of SR is seen by the interrupt logic one
+        // instruction late, a change of CAUSE at once. amidog psxtest_cpx:
+        // after "mtc0 cause" raises a software interrupt, EPC is the very
+        // next instruction; after "mtc0 sr" enables a pending one, the next
+        // instruction still executes and EPC is the one after it. (psx-spx
+        // "Caution - Store Delay" mentions such a delay only for SR bit 30.)
+        let sr = std::mem::replace(&mut self.sr_seen, self.cop0.sr);
+        if sr & SR_IEC != 0 && sr & self.cop0.cause & CAUSE_IP != 0 {
             // psx-spx: "Interrupts vs GTE Commands" — "If an interrupt
             // occurs 'on' a GTE command (cop2cmd), then the GTE command is
             // executed, but nethertheless, the return address in EPC points
@@ -355,6 +406,43 @@ impl Cpu {
         self.execute(Instr(word), bus)
     }
 
+    /// Tests one of the two COP0 breakpoints. Returns true if the debug
+    /// exception must be taken.
+    ///
+    /// psx-spx: "COP0 - Debug Registers": the condition is "((addr XOR BDA)
+    /// AND BDAM)=0" (likewise BPC/BPCM), under DCIC bit 23 "Debug Enable"
+    /// and the specific enable bit. A match sets the status bits; bit 31
+    /// selects "0=Only set status bits, 1=Jump to debug vector".
+    ///
+    /// Deviation: psx-spx names bits 29/30 "Kernel/User Debug Enable ...
+    /// Break in kernel/user mode". amidog psxtest_cpx, which runs entirely
+    /// in kernel mode, shows they select by the address being compared: bit
+    /// 29 enables matches in the kernel segments (80000000h and up), bit 30
+    /// in KUSEG. With only bit 29 set, an access at 4xxxxxxxh neither
+    /// breaks nor sets status bits.
+    fn breakpoint(&mut self, enable: u32, status: u32, addr: u32, value: u32, mask: u32) -> bool {
+        let dcic = self.cop0.dcic;
+        let segment = if addr >= 0x8000_0000 { DCIC_KERNEL } else { DCIC_USER };
+        let required = DCIC_ENABLE | enable | segment;
+        if dcic & required != required || (addr ^ value) & mask != 0 {
+            return false;
+        }
+        self.cop0.dcic |= DCIC_ANY | status;
+        self.debug_break = dcic & DCIC_TRAP != 0;
+        self.debug_break
+    }
+
+    /// The data address breakpoint, for a load (`write` false) or a store.
+    /// Returns true if the debug exception must be taken.
+    fn data_breakpoint(&mut self, addr: u32, write: bool) -> bool {
+        let (enable, status) = if write {
+            (DCIC_DATA_ENABLE | DCIC_WRITE_ENABLE, DCIC_DATA | DCIC_WRITE)
+        } else {
+            (DCIC_DATA_ENABLE | DCIC_READ_ENABLE, DCIC_DATA | DCIC_READ)
+        };
+        self.breakpoint(enable, status, addr, self.cop0.bda, self.cop0.bdam)
+    }
+
     /// psx-spx: "COP0 - Exception Handling".
     fn exception(&mut self, e: Exception) {
         let sr = self.cop0.sr;
@@ -364,25 +452,50 @@ impl Cpu {
 
         // ExcCode in bits 2-6; pending interrupt bits are preserved.
         let mut cause = (self.cop0.cause & CAUSE_IP) | ((e as u32) << 2);
-        if e == Exception::CoprocessorUnusable {
-            cause |= self.cop_number << 28; // CE
+        // CE, bits 28-29. psx-spx describes it as "the coprocessor number
+        // if the exception occurred because of a coprocessor instruction
+        // for a coprocessor which wasn't enabled". amidog psxtest_cpx shows
+        // it is bits 26-27 of the instruction, and that address errors and
+        // reserved instructions set it too (a misaligned LW, opcode 23h,
+        // reports CE=3; so does the undefined opcode 17h), while bus errors
+        // and COP0 breakpoints leave it zero. Interrupts leave it zero here
+        // as well; the test has no case that tells. The other exceptions
+        // come from opcodes whose bits 26-27 are zero anyway.
+        let no_ce = matches!(e, Exception::BusData | Exception::BusFetch | Exception::Interrupt) || self.debug_break;
+        if !no_ce {
+            cause |= self.opcode_cop << 28;
         }
         // psx-spx: "cop0r14 - EPC": with BD set, EPC points at the branch.
         if self.delay_slot {
             cause |= CAUSE_BD;
             self.cop0.epc = self.current_pc.wrapping_sub(4);
-            // psx-spx: "cop0r6 - TAR": updated when the branch is taken.
             if self.delay_taken {
                 cause |= CAUSE_BT;
-                self.cop0.tar = self.branch_target;
             }
+            // psx-spx: "cop0r6 - TAR": "updated to contain the destination
+            // address of the jump or branch" when it is taken. On hardware
+            // it is also updated when the branch is not taken, to the
+            // address after the delay slot (amidog psxtest_cpx) — in both
+            // cases where execution would have continued, which is what
+            // `pc` holds while the delay slot executes.
+            self.cop0.tar = self.pc;
         } else {
             self.cop0.epc = self.current_pc;
         }
         self.cop0.cause = cause;
 
-        let vector = if sr & SR_BEV != 0 { VECTOR_GENERAL_ROM } else { VECTOR_GENERAL_RAM };
+        // psx-spx: "When a breakpoint address match occurs the PSX jumps to
+        // 80000040h (i.e. unlike normal exceptions, not to 80000080h)".
+        let bev = sr & SR_BEV != 0;
+        let vector = match (std::mem::take(&mut self.debug_break), bev) {
+            (false, false) => VECTOR_GENERAL_RAM,
+            (false, true) => VECTOR_GENERAL_ROM,
+            (true, false) => VECTOR_BREAK_RAM,
+            (true, true) => VECTOR_BREAK_ROM,
+        };
         self.set_pc(vector);
+        // Entering the handler disables interrupts at once.
+        self.sr_seen = self.cop0.sr;
         // The faulting instruction has no effect on registers.
         self.writeback = None;
         self.load = None;
@@ -411,7 +524,6 @@ impl Cpu {
     fn jump(&mut self, target: u32) {
         self.branch = true;
         self.branch_taken = true;
-        self.branch_target = target;
         self.next_pc = target;
     }
 
@@ -422,13 +534,40 @@ impl Cpu {
     }
 
     fn check_address(&mut self, addr: u32, align: u32, e: Exception) -> Result<(), Exception> {
+        // psx-spx: "COP0 - Debug Registers" — the data address breakpoint.
+        // Not in psx-spx, from amidog psxtest_cpx: a match sets the DCIC
+        // status bits even if the access then raises an address error
+        // (lh_8_8_1), the address error is raised in preference to the
+        // break (sh_8_8_1), and the break in preference to a bus error at
+        // the same address (sb_8_4_0).
+        let breaks = self.data_breakpoint(addr, e == Exception::AddressStore);
         // psx-spx: "Load/Store Alignment".
         if addr & (align - 1) != 0 || self.kseg_violation(addr) {
+            self.debug_break = false;
             // psx-spx: "cop0r8 - BadVaddr": updated only by address errors.
             self.cop0.badvaddr = addr;
             return Err(e);
         }
+        if breaks {
+            return Err(Exception::Break);
+        }
         Ok(())
+    }
+
+    /// The bus access of LWL/LWR/SWL/SWR, which always use the aligned
+    /// word.
+    fn load_aligned_word(&mut self, bus: &mut Bus, addr: u32) -> Result<u32, Exception> {
+        if self.cache_isolated() {
+            return Ok(0);
+        }
+        bus.load32(addr & !3).map_err(|_| Exception::BusData)
+    }
+
+    fn store_aligned_word(&mut self, bus: &mut Bus, addr: u32, value: u32) -> Result<(), Exception> {
+        if self.cache_isolated() {
+            return Ok(());
+        }
+        bus.store(addr & !3, Width::Word, value).map_err(|_| Exception::BusData)
     }
 
     /// psx-spx: "cop0r12 - SR" bit 16 (IsC): while the cache is isolated,
@@ -483,11 +622,6 @@ impl Cpu {
             Some((r, value)) if r == reg => value,
             _ => self.regs[reg],
         }
-    }
-
-    fn coprocessor_unusable(&mut self, number: u32) -> Exception {
-        self.cop_number = number;
-        Exception::CoprocessorUnusable
     }
 
     // ---- decoder -----------------------------------------------------------
@@ -564,7 +698,11 @@ impl Cpu {
             0x22 => {
                 // LWL. psx-spx: "Unaligned Load/Store (Details)".
                 let cur = self.reg_with_pending_load(i.rt());
-                let word = self.load32(bus, addr & !3)?;
+                // LWL at address A reads bytes (A AND NOT 3)..A. The data
+                // breakpoint compares the lowest of them, the aligned
+                // address (amidog psxtest_cpx; not in psx-spx).
+                self.check_address(addr & !3, 1, Exception::AddressLoad)?;
+                let word = self.load_aligned_word(bus, addr)?;
                 let value = match addr & 3 {
                     0 => (cur & 0x00FF_FFFF) | (word << 24),
                     1 => (cur & 0x0000_FFFF) | (word << 16),
@@ -588,7 +726,10 @@ impl Cpu {
             0x26 => {
                 // LWR. psx-spx: "Unaligned Load/Store (Details)".
                 let cur = self.reg_with_pending_load(i.rt());
-                let word = self.load32(bus, addr & !3)?;
+                // LWR at address A reads bytes A..(A OR 3): the lowest
+                // one, which the data breakpoint compares, is A itself.
+                self.check_address(addr, 1, Exception::AddressLoad)?;
+                let word = self.load_aligned_word(bus, addr)?;
                 let value = match addr & 3 {
                     0 => word,
                     1 => (cur & 0xFF00_0000) | (word >> 8),
@@ -601,28 +742,28 @@ impl Cpu {
             0x29 => self.store(bus, addr, Width::Half, rt)?,
             0x2A => {
                 // SWL. psx-spx: "Unaligned Load/Store (Details)".
-                let aligned = addr & !3;
-                let mem = self.load32(bus, aligned)?;
+                self.check_address(addr & !3, 1, Exception::AddressStore)?;
+                let mem = self.load_aligned_word(bus, addr)?;
                 let value = match addr & 3 {
                     0 => (mem & 0xFFFF_FF00) | (rt >> 24),
                     1 => (mem & 0xFFFF_0000) | (rt >> 16),
                     2 => (mem & 0xFF00_0000) | (rt >> 8),
                     _ => rt,
                 };
-                self.store(bus, aligned, Width::Word, value)?;
+                self.store_aligned_word(bus, addr, value)?;
             }
             0x2B => self.store(bus, addr, Width::Word, rt)?,
             0x2E => {
                 // SWR. psx-spx: "Unaligned Load/Store (Details)".
-                let aligned = addr & !3;
-                let mem = self.load32(bus, aligned)?;
+                self.check_address(addr, 1, Exception::AddressStore)?;
+                let mem = self.load_aligned_word(bus, addr)?;
                 let value = match addr & 3 {
                     0 => rt,
                     1 => (mem & 0x0000_00FF) | (rt << 8),
                     2 => (mem & 0x0000_FFFF) | (rt << 16),
                     _ => (mem & 0x00FF_FFFF) | (rt << 24),
                 };
-                self.store(bus, aligned, Width::Word, value)?;
+                self.store_aligned_word(bus, addr, value)?;
             }
 
             // LWCn/SWCn for the coprocessors without loadable registers.
@@ -630,9 +771,21 @@ impl Cpu {
             // [mem],cop0reg" always raises coprocessor unusable: hardware
             // (ps1-tests cpu/cop: testSwc0Enabled/Disabled, testSwc3*)
             // raises it only while the CU bit is clear — for COP0 even in
-            // kernel mode — and otherwise does nothing visible. Whether a
-            // memory access happens in that case is unknown; none is made.
-            0x30 | 0x31 | 0x33 | 0x38 | 0x39 | 0x3B => self.require_cop(i.op() & 3)?,
+            // kernel mode. With the bit set the memory access still takes
+            // place as far as exceptions go: a bad address raises an
+            // address error or bus error (amidog psxtest_cpx). What a
+            // store writes is unknown; nothing is written here.
+            0x30 | 0x31 | 0x33 => {
+                self.require_cop(i.op() & 3)?;
+                self.load32(bus, addr)?;
+            }
+            0x38 | 0x39 | 0x3B => {
+                self.require_cop(i.op() & 3)?;
+                self.check_address(addr, 4, Exception::AddressStore)?;
+                if !self.cache_isolated() {
+                    bus.probe(addr).map_err(|_| Exception::BusData)?;
+                }
+            }
             // psx-spx: "CPU Coprocessor Opcodes" — "lwc# rt,imm(rs)
             // ;cop#dat_rt = [rs+imm]" and "swc#": GTE data registers only.
             0x32 => {
@@ -753,7 +906,7 @@ impl Cpu {
         let garbage_read = field == 0x00 && reg >= 16;
         let usable = self.cop0.sr & SR_KUC == 0 || self.cop0.sr & SR_CU0 != 0;
         if !usable && !garbage_read {
-            return Err(self.coprocessor_unusable(0));
+            return Err(Exception::CoprocessorUnusable);
         }
 
         match field {
@@ -782,12 +935,11 @@ impl Cpu {
             }
             0x04 => {
                 // MTC0. Read-only and missing registers ignore writes.
-                // Breakpoints (BPC/BDA/DCIC) are stored but not acted upon.
                 let value = self.regs[i.rt()];
                 match reg {
                     3 => self.cop0.bpc = value,
                     5 => self.cop0.bda = value,
-                    7 => self.cop0.dcic = value,
+                    7 => self.cop0.dcic = value & DCIC_WRITE_MASK,
                     9 => self.cop0.bdam = value,
                     11 => self.cop0.bpcm = value,
                     12 => self.cop0.sr = value & SR_WRITE_MASK,
@@ -800,7 +952,7 @@ impl Cpu {
             // reading raises RI. Writing is not documented; RI as well.
             0x02 | 0x06 => return Err(Exception::Reserved),
             // BC0F/BC0T: psx-spx "jf/jt cop0flg,dest" — coprocessor unusable.
-            0x08 => return Err(self.coprocessor_unusable(0)),
+            0x08 => return Err(Exception::CoprocessorUnusable),
             // psx-spx: "cop0cmd=10h - RFE": SR bits 2-3 -> 0-1 and
             // bits 4-5 -> 2-3; bits 4-5 are left unchanged.
             0x10..=0x1F if i.funct() == 0x10 => {
@@ -825,7 +977,7 @@ impl Cpu {
     /// whose bit is clear raises coprocessor unusable with CE = its number.
     fn require_cop(&mut self, number: u32) -> Result<(), Exception> {
         if self.cop0.sr & (SR_CU0 << number) == 0 {
-            return Err(self.coprocessor_unusable(number));
+            return Err(Exception::CoprocessorUnusable);
         }
         Ok(())
     }
@@ -1472,12 +1624,15 @@ mod tests {
         assert_ne!(m.cpu.cause() & CAUSE_BT, 0);
         assert_eq!(m.cpu.cop0.tar, BASE + 8 + 16);
 
-        // Untaken branch: BD set, BT clear.
+        // Untaken branch: BD set, BT clear. TAR holds the address after the
+        // delay slot (amidog psxtest_cpx; psx-spx only mentions taken
+        // branches).
         let mut m = Machine::new(&[itype(0x05, 0, 0, 4), SYSCALL]);
         m.steps(2);
         m.assert_exception(Exception::Syscall, BASE);
         assert_ne!(m.cpu.cause() & CAUSE_BD, 0);
         assert_eq!(m.cpu.cause() & CAUSE_BT, 0);
+        assert_eq!(m.cpu.cop0.tar, BASE + 8);
     }
 
     #[test]
@@ -1671,22 +1826,25 @@ mod tests {
     #[test]
     fn interrupted_gte_command_still_executes() {
         // psx-spx: "Interrupts vs GTE Commands".
-        let mut m = Machine::new(&[0x4B40_0006]); // NCLIP
+        // (The interrupt lands on the second instruction: see
+        // `interrupt_taken_only_when_enabled_and_unmasked`.)
+        let mut m = Machine::new(&[NOP, 0x4B40_0006]); // NCLIP
         m.cpu.gte.write(12, 0x0000_0000);
         m.cpu.gte.write(13, 0x0000_000A);
         m.cpu.gte.write(14, 0x000A_0000);
         m.cpu.cop0.sr = CU2 | 0x0401;
         m.cpu.set_irq(true);
-        m.steps(1);
-        m.assert_exception(Exception::Interrupt, BASE);
+        m.steps(2);
+        m.assert_exception(Exception::Interrupt, BASE + 4);
         assert_eq!(m.cpu.gte.read(24), 100, "the command ran although EPC points at it");
 
         // Any other instruction is not executed when interrupted.
-        let mut m = Machine::new(&[mtc2(1, 9)]);
+        let mut m = Machine::new(&[NOP, mtc2(1, 9)]);
         m.cpu.set_reg(1, 55);
         m.cpu.cop0.sr = CU2 | 0x0401;
         m.cpu.set_irq(true);
-        m.steps(1);
+        m.steps(2);
+        m.assert_exception(Exception::Interrupt, BASE + 4);
         assert_eq!(m.cpu.gte.read(9), 0);
     }
 
@@ -1720,6 +1878,241 @@ mod tests {
         m.assert_exception(Exception::AddressLoad, BASE);
     }
 
+    #[test]
+    fn cause_ce_field_mirrors_the_opcode_of_the_faulting_instruction() {
+        // amidog psxtest_cpx: CE (CAUSE bits 28-29) is bits 26-27 of the
+        // instruction for address errors as well as coprocessor unusable.
+        let ce = |instr: u32, r1: u32| {
+            let mut m = Machine::new(&[instr]);
+            m.cpu.set_reg(1, r1);
+            m.steps(1);
+            assert_ne!(m.cpu.pc(), BASE + 4, "an exception was expected");
+            (m.cpu.cause() >> 28) & 3
+        };
+        assert_eq!(ce(lw(2, 1, 0), DATA + 2), 3, "LW = 23h");
+        assert_eq!(ce(itype(0x21, 1, 2, 0), DATA + 1), 1, "LH = 21h");
+        assert_eq!(ce(itype(0x29, 1, 2, 0), DATA + 1), 1, "SH = 29h");
+        // Bus errors leave it zero whatever the opcode.
+        assert_eq!(ce(itype(0x22, 1, 2, 0), 0x4000_0000), 0, "LWL, bus error");
+        assert_eq!(ce(itype(0x2B, 1, 2, 0), 0x4000_0000), 0, "SW, bus error");
+        // Reserved instructions set it as well (amidog: opcodes 15h, 17h).
+        assert_eq!(ce(0x15 << 26, 0), 1);
+        assert_eq!(ce(0x17 << 26, 0), 3);
+        assert_eq!(ce(SYSCALL, 0), 0);
+        // A fault of the fetch itself has no instruction: CE = 0.
+        let mut m = Machine::new(&[]);
+        m.cpu.cop0.cause = 0;
+        m.cpu.set_pc(0x4000_0000);
+        m.steps(1);
+        assert_eq!(m.cpu.cause() >> 28, 0);
+    }
+
+    #[test]
+    fn lwc_and_swc_of_enabled_missing_coprocessors_still_fault_on_bad_addresses() {
+        // amidog psxtest_cpx. ps1-tests cpu/cop covers the valid-address
+        // case (no exception).
+        let run = |instr: u32, addr: u32| {
+            let mut m = Machine::new(&[instr]);
+            m.cpu.cop0.sr = 0xF000_0000;
+            m.cpu.set_reg(1, addr);
+            m.steps(1);
+            if m.cpu.pc() == BASE + 4 {
+                None
+            } else {
+                Some(m.cpu.cause() & 0x3000_007C)
+            }
+        };
+        let (lwc0, lwc3, swc0, swc1) = (itype(0x30, 1, 0, 0), itype(0x33, 1, 0, 0), itype(0x38, 1, 0, 0), itype(0x39, 1, 0, 0));
+        assert_eq!(run(lwc0, DATA), None);
+        assert_eq!(run(swc0, DATA), None);
+        assert_eq!(run(lwc0, DATA + 1), Some(0x10), "AdEL, CE=0");
+        assert_eq!(run(lwc3, DATA + 1), Some(0x3000_0010), "AdEL, CE=3");
+        assert_eq!(run(swc1, DATA + 2), Some(0x1000_0014), "AdES, CE=1");
+        assert_eq!(run(swc0, 0x4000_0000), Some(0x1C), "DBE");
+        assert_eq!(run(lwc3, 0x4000_0000), Some(0x1C), "DBE, CE stays 0");
+    }
+
+    // ---- COP0 breakpoints --------------------------------------------------
+
+    /// DCIC with the debug feature, both modes and the trap enabled.
+    const DCIC_ON: u32 = DCIC_ENABLE | DCIC_KERNEL | DCIC_USER | DCIC_TRAP;
+
+    #[test]
+    fn program_counter_breakpoint() {
+        // psx-spx: "COP0 - Debug Registers".
+        let mut m = Machine::new(&[addiu(1, 0, 1), addiu(2, 0, 2), addiu(3, 0, 3)]);
+        m.cpu.cop0.bpc = BASE + 4;
+        m.cpu.cop0.bpcm = 0xFFFF_FFFF;
+        m.cpu.cop0.dcic = DCIC_ON | DCIC_PC_ENABLE;
+        m.steps(2);
+        // "jumps to 80000040h", "Excode ... 09h", EPC = the breakpoint.
+        assert_eq!(m.cpu.pc(), VECTOR_BREAK_RAM);
+        assert_eq!(m.excode(), 9);
+        assert_eq!(m.cpu.epc(), BASE + 4);
+        assert_eq!((m.cpu.reg(1), m.cpu.reg(2)), (1, 0), "the instruction at the breakpoint did not run");
+        assert_eq!(m.cpu.cop0.dcic & 0x3F, DCIC_ANY | DCIC_PC);
+    }
+
+    #[test]
+    fn breakpoint_mask_and_enable_bits() {
+        let hit = |dcic: u32, mask: u32, sr: u32| {
+            let mut m = Machine::new(&[NOP, NOP]);
+            m.cpu.cop0.bpc = BASE & 0xFFFF_0000;
+            m.cpu.cop0.bpcm = mask;
+            m.cpu.cop0.dcic = dcic;
+            m.cpu.cop0.sr = sr;
+            m.steps(1);
+            (m.cpu.pc() == VECTOR_BREAK_RAM, m.cpu.cop0.dcic & 0x3F)
+        };
+        let on = DCIC_ON | DCIC_PC_ENABLE;
+        // "((PC XOR BPC) AND BPCM)=0": only the masked bits must match.
+        assert_eq!(hit(on, 0xFFFF_0000, 0), (true, 3));
+        assert_eq!(hit(on, 0xFFFF_FFFF, 0), (true, 3));
+        assert_eq!(hit(on, 0xFFFF_FFFF, 0).0, BASE & 0xFFFF == 0);
+        // Every enable is needed: debug enable, the PC enable, and the bit
+        // for the segment of the address (the program is in KSEG0).
+        assert_eq!(hit(on & !DCIC_ENABLE, 0xFFFF_0000, 0), (false, 0));
+        assert_eq!(hit(on & !DCIC_PC_ENABLE, 0xFFFF_0000, 0), (false, 0));
+        assert_eq!(hit(on & !DCIC_KERNEL, 0xFFFF_0000, 0), (false, 0));
+        assert_eq!(hit(on & !DCIC_USER, 0xFFFF_0000, 0), (true, 3));
+        // "0=Only set status bits, 1=Jump to debug vector".
+        assert_eq!(hit(on & !DCIC_TRAP, 0xFFFF_0000, 0), (false, 3));
+        // The boot vector variant.
+        let mut m = Machine::new(&[NOP]);
+        m.cpu.cop0.bpc = BASE;
+        m.cpu.cop0.bpcm = 0xFFFF_FFFF;
+        m.cpu.cop0.dcic = on;
+        m.cpu.cop0.sr = SR_BEV;
+        m.steps(1);
+        assert_eq!(m.cpu.pc(), VECTOR_BREAK_ROM);
+    }
+
+    #[test]
+    fn program_counter_breakpoint_wins_over_a_fetch_fault() {
+        // amidog psxtest_cpx (pc_c_x): breakpoint on an unmapped address.
+        let mut m = Machine::new(&[]);
+        m.cpu.cop0.bpc = 0xC000_1000;
+        m.cpu.cop0.bpcm = 0xFFFF_FFFF;
+        m.cpu.cop0.dcic = DCIC_ON | DCIC_PC_ENABLE;
+        m.cpu.set_pc(0xC000_1000);
+        m.steps(1);
+        assert_eq!((m.cpu.pc(), m.excode()), (VECTOR_BREAK_RAM, 9));
+    }
+
+    #[test]
+    fn data_breakpoints() {
+        let run = |instr: u32, dcic: u32, addr: u32| {
+            let mut m = with_data(0x1234_5678, &[instr, NOP]);
+            m.cpu.set_reg(1, addr);
+            m.cpu.set_reg(2, 0xAAAA);
+            m.cpu.cop0.bda = DATA;
+            m.cpu.cop0.bdam = 0xFFFF_FFFC;
+            m.cpu.cop0.dcic = dcic;
+            m.steps(1);
+            let broke = m.cpu.pc() == VECTOR_BREAK_RAM;
+            m.steps(1);
+            (broke, m.cpu.cop0.dcic & 0x3F, m.cpu.reg(2), m.bus.load32(DATA).unwrap())
+        };
+        let read = DCIC_ON | DCIC_DATA_ENABLE | DCIC_READ_ENABLE;
+        let write = DCIC_ON | DCIC_DATA_ENABLE | DCIC_WRITE_ENABLE;
+        let status_read = DCIC_ANY | DCIC_DATA | DCIC_READ;
+        let status_write = DCIC_ANY | DCIC_DATA | DCIC_WRITE;
+        // A load at the address breaks before loading.
+        assert_eq!(run(lw(2, 1, 0), read, DATA), (true, status_read, 0xAAAA, 0x1234_5678));
+        // The mask ignores the low two bits: a byte load at DATA+3 matches.
+        assert!(run(itype(0x20, 1, 2, 3), read, DATA).0);
+        // LWR at DATA+1 is compared as DATA+1, inside the masked word.
+        assert!(run(itype(0x26, 1, 2, 1), read, DATA).0);
+        // Elsewhere (the word at DATA+8 is zero and gets loaded), or with
+        // only the write enable: no break.
+        assert_eq!(run(lw(2, 1, 8), read, DATA), (false, 0, 0, 0x1234_5678));
+        assert_eq!(run(lw(2, 1, 0), write, DATA), (false, 0, 0x1234_5678, 0x1234_5678));
+        // A store breaks before writing.
+        assert_eq!(run(sw(2, 1, 0), write, DATA), (true, status_write, 0xAAAA, 0x1234_5678));
+        assert_eq!(run(sw(2, 1, 0), read, DATA), (false, 0, 0xAAAA, 0x0000_AAAA));
+    }
+
+    #[test]
+    fn address_errors_win_over_breakpoints() {
+        // amidog psxtest_cpx (pc_1_x, sh_8_8_1).
+        let mut m = Machine::new(&[]);
+        m.cpu.cop0.bpcm = 0; // matches every PC
+        m.cpu.cop0.dcic = DCIC_ON | DCIC_PC_ENABLE;
+        m.cpu.set_pc(BASE + 1);
+        m.steps(1);
+        assert_eq!((m.cpu.pc(), m.excode()), (VECTOR_GENERAL_RAM, 4));
+        assert_eq!(m.cpu.badvaddr(), BASE + 1);
+
+        let mut m = with_data(0, &[itype(0x29, 1, 2, 1)]); // sh to an odd address
+        m.cpu.cop0.bdam = 0;
+        m.cpu.cop0.dcic = DCIC_ON | DCIC_DATA_ENABLE | DCIC_WRITE_ENABLE;
+        m.steps(1);
+        assert_eq!((m.cpu.pc(), m.excode()), (VECTOR_GENERAL_RAM, 5));
+        // ...but the match is still recorded in the status bits (lh_8_8_1).
+        assert_eq!(m.cpu.cop0.dcic & 0x3F, DCIC_ANY | DCIC_DATA | DCIC_WRITE);
+    }
+
+    #[test]
+    fn breakpoint_segment_bits_follow_the_address_not_the_cpu_mode() {
+        // amidog psxtest_cpx (lb_8_4_0 with DCIC = A6800000h / 26800000h):
+        // kernel-mode code reading a KUSEG address with only bit 29 set.
+        let run = |dcic: u32, addr: u32| {
+            let mut m = Machine::new(&[lw(2, 1, 0)]);
+            m.cpu.set_reg(1, addr);
+            m.cpu.cop0.bdam = 0; // every address matches
+            m.cpu.cop0.dcic = dcic;
+            m.steps(1);
+            (m.cpu.pc() == VECTOR_BREAK_RAM, m.cpu.cop0.dcic & 0x3F)
+        };
+        let base = DCIC_ENABLE | DCIC_DATA_ENABLE | DCIC_READ_ENABLE | DCIC_TRAP;
+        let kuseg_data = DATA & 0x1FFF_FFFF;
+        assert_eq!(run(base | DCIC_KERNEL, kuseg_data), (false, 0));
+        assert_eq!(run(base | DCIC_USER, kuseg_data), (true, 0x0D));
+        assert_eq!(run(base | DCIC_KERNEL, DATA), (true, 0x0D));
+        assert_eq!(run(base | DCIC_USER, DATA), (false, 0));
+    }
+
+    #[test]
+    fn unaligned_word_instructions_compare_the_lowest_byte_they_touch() {
+        // amidog psxtest_cpx, with BDA exact (mask FFFFFFFFh): LWL/SWL at
+        // A touch (A AND NOT 3)..A, LWR/SWR touch A..(A OR 3).
+        let breaks = |instr: u32, bda: u32| {
+            let mut m = with_data(0, &[instr]);
+            m.cpu.cop0.bda = bda;
+            m.cpu.cop0.bdam = 0xFFFF_FFFF;
+            m.cpu.cop0.dcic = DCIC_ON | DCIC_DATA_ENABLE | DCIC_READ_ENABLE | DCIC_WRITE_ENABLE;
+            m.steps(1);
+            m.cpu.pc() == VECTOR_BREAK_RAM
+        };
+        for (lwl_or_swl, lwr_or_swr) in [(itype(0x22, 1, 2, 2), itype(0x26, 1, 2, 2)), (itype(0x2A, 1, 2, 2), itype(0x2E, 1, 2, 2))] {
+            // Both at DATA+2.
+            assert!(breaks(lwl_or_swl, DATA), "left: the aligned address");
+            assert!(!breaks(lwl_or_swl, DATA + 2));
+            assert!(breaks(lwr_or_swr, DATA + 2), "right: the address itself");
+            assert!(!breaks(lwr_or_swr, DATA));
+        }
+    }
+
+    #[test]
+    fn data_breakpoint_wins_over_a_bus_error() {
+        // amidog psxtest_cpx (sb_8_4_0).
+        let mut m = Machine::new(&[itype(0x28, 1, 2, 0)]);
+        m.cpu.set_reg(1, 0x4000_0000);
+        m.cpu.cop0.bda = 0x4000_0000;
+        m.cpu.cop0.bdam = 0xFFFF_FFFF;
+        m.cpu.cop0.dcic = DCIC_ON | DCIC_DATA_ENABLE | DCIC_WRITE_ENABLE;
+        m.steps(1);
+        assert_eq!((m.cpu.pc(), m.excode()), (VECTOR_BREAK_RAM, 9));
+    }
+
+    #[test]
+    fn dcic_unused_bits_read_zero() {
+        let mut m = Machine::new(&[mtc0(1, 7), mfc0(2, 7), NOP]);
+        m.cpu.set_reg(1, !DCIC_ENABLE);
+        m.steps(3);
+        assert_eq!(m.cpu.reg(2), DCIC_WRITE_MASK & !DCIC_ENABLE);
+    }
+
     // ---- interrupts --------------------------------------------------------
 
     #[test]
@@ -1739,12 +2132,17 @@ mod tests {
         m.steps(1);
         assert_eq!(m.cpu.reg(1), 1);
 
+        // Enabled and unmasked: taken. SR was changed just before the
+        // first instruction, and a change of SR is seen one instruction
+        // late (amidog psxtest_cpx), so the first instruction still runs.
         let mut m = Machine::new(&prog);
         m.cpu.set_irq(true);
         m.cpu.cop0.sr = 0x0401;
         m.steps(1);
-        m.assert_exception(Exception::Interrupt, BASE);
-        assert_eq!(m.cpu.reg(1), 0, "interrupted instruction did not run");
+        assert_eq!(m.cpu.reg(1), 1, "the first instruction still runs");
+        m.steps(1);
+        m.assert_exception(Exception::Interrupt, BASE + 4);
+        assert_eq!(m.cpu.reg(2), 0, "interrupted instruction did not run");
         assert_ne!(m.cpu.cause() & CAUSE_IP2, 0, "IP stays visible");
         assert_eq!(m.cpu.sr() & 1, 0, "interrupts disabled in handler");
 
@@ -1755,9 +2153,37 @@ mod tests {
     #[test]
     fn software_interrupt() {
         let [a, b] = li(1, 0x0000_0101);
-        let mut m = Machine::new(&[a, b, mtc0(1, 12), ori(2, 0, 0x100), mtc0(2, 13), NOP]);
+        // amidog psxtest_cpx, the two orders of its INTERRUPT test.
+        // SR enabled first (+8), then "mtc0 cause" raises the software
+        // interrupt (+16): the very next instruction is interrupted.
+        let mut m = Machine::new(&[a, b, mtc0(1, 12), ori(2, 0, 0x100), mtc0(2, 13), addiu(3, 0, 7), NOP]);
         m.steps(6);
         m.assert_exception(Exception::Interrupt, BASE + 20);
+        assert_eq!(m.cpu.reg(3), 0, "the instruction after the CAUSE write did not run");
+
+        // Request raised first (+12), then "mtc0 sr" enables it (+16): the
+        // next instruction (+20) still runs and EPC is the one after it.
+        let mut m = Machine::new(&[a, b, ori(2, 0, 0x100), mtc0(2, 13), mtc0(1, 12), addiu(3, 0, 7), NOP]);
+        m.steps(6);
+        assert_eq!(m.cpu.reg(3), 7);
+        assert_eq!(m.cpu.pc(), BASE + 24, "not taken yet");
+        m.steps(1);
+        m.assert_exception(Exception::Interrupt, BASE + 24);
+    }
+
+    #[test]
+    fn handler_entry_and_return_do_not_retake_the_interrupt_at_once() {
+        // Exception entry disables interrupts at once: the first handler
+        // instruction runs even though the request is still pending.
+        let mut m = Machine::new(&[NOP, NOP]);
+        m.bus.write_ram(0x80, &addiu(5, 0, 9).to_le_bytes());
+        m.cpu.set_irq(true);
+        m.cpu.cop0.sr = 0x0401;
+        m.steps(2);
+        m.assert_exception(Exception::Interrupt, BASE + 4);
+        m.steps(1);
+        assert_eq!(m.cpu.reg(5), 9);
+        assert_eq!(m.cpu.pc(), VECTOR_GENERAL_RAM + 4);
     }
 
     #[test]

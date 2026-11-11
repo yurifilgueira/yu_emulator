@@ -221,6 +221,17 @@ impl Bus {
         self.store(addr, Width::Word, val)
     }
 
+    /// Tells whether anything answers at `vaddr`, without accessing it
+    /// (no register side effects).
+    pub fn probe(&mut self, vaddr: u32) -> Result<(), BusFault> {
+        let addr = mask_region(vaddr);
+        if map::IO_PORTS.contains(addr).is_some() || map::EXPANSION_2.contains(addr).is_some() {
+            return Ok(());
+        }
+        // Everything else has no read side effects.
+        self.load(vaddr, Width::Byte).map(|_| ())
+    }
+
     /// Copies bytes straight into RAM, bypassing the CPU.
     /// Used by the harness to sideload PS-EXE files (Phase 2).
     pub fn write_ram(&mut self, phys_offset: u32, data: &[u8]) {
