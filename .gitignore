@@ -10,3 +10,6 @@
 /tests/ps1-tests/
 /tests/amidog/
 /games/
+/roms-for-test/
+*.7z
+*.zip

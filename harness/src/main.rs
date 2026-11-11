@@ -11,10 +11,12 @@
 //!   or reference image next to it and prints a pass/fail table.
 
 mod image;
+mod input;
 
 use image::Rgb;
 use psx_core::disasm::disassemble;
 use psx_core::exe::Exe;
+use psx_core::sio::{DigitalPad, MemoryCard};
 use psx_core::{map, Bus, Psx};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -33,10 +35,11 @@ fn usage() -> ExitCode {
         "usage:\n  \
          harness bios <bios.bin>\n      \
          check a BIOS image and read the reset vector\n  \
-         harness run <bios.bin> [--cycles N] [--trace] [--trace-from CYCLE] [pictures]\n      \
+         harness run <bios.bin> [--cycles N] [--trace] [--trace-from CYCLE] [--trace-pc LO-HI] [pictures]\n      \
          boot the BIOS for N cycles (default {DEFAULT_CYCLES}); TTY output goes to stdout,\n      \
-         the instruction trace (--trace) and the final report go to stderr\n  \
-         harness exe <bios.bin> <file.exe> [--cycles N] [--trace] [--trace-from CYCLE] [--expect <log>] [pictures]\n      \
+         the instruction trace (--trace) and the final report go to stderr;\n      \
+         --trace-pc limits the trace to instructions at hexadecimal addresses LO..=HI\n  \
+         harness exe <bios.bin> <file.exe> [--cycles N] [--trace] [--trace-from CYCLE] [--trace-pc LO-HI] [--expect <log>] [pictures]\n      \
          boot the BIOS up to its shell, then run the PS-EXE for N cycles;\n      \
          with --expect, stop at the reference log's last line and exit 0 only if the\n      \
          output agrees with it: if the log has \"pass - \"/\"fail - \" lines, every test that\n      \
@@ -53,7 +56,12 @@ fn usage() -> ExitCode {
          run every PS-EXE under <dir> that has a {REFERENCE_LOG} or {REFERENCE_VRAM} next to it, judge\n      \
          each like `exe --expect` / `vram-hash --expect`, and print a table; exit 0 only\n      \
          if all of them pass\n\n\
-         pictures: [--vram-out <png>] writes the whole VRAM, [--frame-out <png>] the displayed picture"
+         pictures: [--vram-out <png>] writes the whole VRAM, [--frame-out <png>] the displayed picture\n\
+         devices (run, exe, vram-hash): a digital pad is plugged into port 1.\n  \
+         --press BUTTON[+BUTTON]@FRAME[+LENGTH]  hold buttons from a video frame of the run\n      \
+         (repeatable; buttons: select start up right down left l1 l2 r1 r2 triangle circle cross square)\n  \
+         --card <file>  memory card in slot 1: a raw 128 KB image, created formatted if\n      \
+         missing and written back if the program changed it"
     );
     ExitCode::from(2)
 }
@@ -118,12 +126,18 @@ struct RunOptions {
     trace: bool,
     /// First cycle (counted like --cycles) at which --trace starts printing.
     trace_from: u64,
+    /// --trace-pc LO-HI: only trace instructions whose address is in range.
+    trace_pc: Option<(u32, u32)>,
     expect: Option<String>,
     vram_out: Option<String>,
     frame_out: Option<String>,
     diff_out: Option<String>,
     /// --region X,Y,W,H: the part of VRAM that vram-hash --expect compares.
     region: Option<image::Region>,
+    /// --press entries.
+    script: input::Script,
+    /// --card: memory card image for slot 1.
+    card: Option<String>,
 }
 
 impl RunOptions {
@@ -132,11 +146,14 @@ impl RunOptions {
             cycles: DEFAULT_CYCLES,
             trace: false,
             trace_from: 0,
+            trace_pc: None,
             expect: None,
             vram_out: None,
             frame_out: None,
             diff_out: None,
             region: None,
+            script: input::Script::default(),
+            card: None,
         };
         let mut args = args.iter();
         while let Some(arg) = args.next() {
@@ -147,10 +164,23 @@ impl RunOptions {
                     options.trace = true;
                     options.trace_from = args.next()?.replace('_', "").parse().ok()?;
                 }
+                "--trace-pc" => {
+                    let (low, high) = args.next()?.split_once('-')?;
+                    let hex = |text: &str| u32::from_str_radix(text.trim_start_matches("0x"), 16).ok();
+                    options.trace = true;
+                    options.trace_pc = Some((hex(low)?, hex(high)?));
+                }
                 "--expect" => options.expect = Some(args.next()?.clone()),
                 "--vram-out" => options.vram_out = Some(args.next()?.clone()),
                 "--frame-out" => options.frame_out = Some(args.next()?.clone()),
                 "--diff-out" => options.diff_out = Some(args.next()?.clone()),
+                "--card" => options.card = Some(args.next()?.clone()),
+                "--press" => {
+                    if let Err(e) = options.script.add(args.next()?) {
+                        eprintln!("{e}");
+                        return None;
+                    }
+                }
                 "--region" => {
                     let numbers: Vec<usize> = args.next()?.split(',').map(|n| n.parse().ok()).collect::<Option<_>>()?;
                     let [x, y, w, h] = numbers[..] else { return None };
@@ -165,7 +195,31 @@ impl RunOptions {
     /// Only --cycles was given.
     fn is_plain(&self) -> bool {
         let paths = [&self.expect, &self.vram_out, &self.frame_out, &self.diff_out];
-        !self.trace && self.region.is_none() && paths.iter().all(|o| o.is_none())
+        let no_devices = self.card.is_none() && self.script == input::Script::default();
+        !self.trace && self.region.is_none() && no_devices && paths.iter().all(|o| o.is_none())
+    }
+
+    /// Plugs in the devices: a digital pad in port 1 and, with --card, a
+    /// memory card in slot 1.
+    fn plug_devices(&self, psx: &mut Psx) -> Result<(), String> {
+        psx.bus.sio0.ports[0].pad = Some(DigitalPad::default());
+        let Some(path) = &self.card else { return Ok(()) };
+        let card = match std::fs::read(path) {
+            Ok(data) => MemoryCard::new(data).ok_or_else(|| format!("{path}: a memory card image must be 131072 bytes"))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => MemoryCard::formatted(),
+            Err(e) => return Err(format!("could not read {path}: {e}")),
+        };
+        psx.bus.sio0.ports[0].card = Some(card);
+        Ok(())
+    }
+
+    /// Writes the memory card back to its file if the program changed it.
+    fn save_card(&self, psx: &Psx) -> Result<(), String> {
+        let (Some(path), Some(card)) = (&self.card, &psx.bus.sio0.ports[0].card) else { return Ok(()) };
+        if card.dirty {
+            std::fs::write(path, card.data()).map_err(|e| format!("could not write {path}: {e}"))?;
+        }
+        Ok(())
     }
 
     /// Writes the pictures requested with --vram-out / --frame-out.
@@ -296,12 +350,24 @@ fn run(psx: &mut Psx, start: u64, options: &RunOptions, expected: Option<&[Strin
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     let mut captured = Vec::new();
+    let first_frame = psx.bus.gpu.video.frame();
+    let mut frame = u64::MAX;
 
     while psx.cycles() - start < options.cycles {
+        // Scripted input changes at frame boundaries.
+        let now = psx.bus.gpu.video.frame() - first_frame;
+        if now != frame {
+            frame = now;
+            if let Some(pad) = psx.bus.sio0.ports[0].pad.as_mut() {
+                pad.pressed = options.script.pressed(frame);
+            }
+        }
         psx.step();
         if options.trace && psx.cycles() - start >= options.trace_from {
             let (pc, word) = (psx.cpu.current_pc(), psx.cpu.last_instr());
-            eprintln!("{pc:08X}  {word:08X}  {}", disassemble(pc, word));
+            if options.trace_pc.is_none_or(|(low, high)| (low..=high).contains(&pc)) {
+                eprintln!("{pc:08X}  {word:08X}  {}", disassemble(pc, word));
+            }
         }
         let tty = psx.take_tty();
         if tty.is_empty() {
@@ -344,6 +410,9 @@ fn cmd_run(bios: &str, exe: Option<&String>, options: RunOptions) -> ExitCode {
     if let Some(path) = exe {
         eprintln!("---- kernel ready after {start} cycles; running {path} ----");
     }
+    if let Err(e) = options.plug_devices(&mut psx) {
+        return fail(e);
+    }
 
     let captured = run(&mut psx, start, &options, expected.as_deref(), true);
 
@@ -356,6 +425,15 @@ fn cmd_run(bios: &str, exe: Option<&String>, options: RunOptions) -> ExitCode {
         psx.cpu.epc(),
         psx.cpu.badvaddr()
     );
+    // General registers, four per line, with their conventional names.
+    const NAMES: [&str; 32] = [
+        "zero", "at", "v0", "v1", "a0", "a1", "a2", "a3", "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7", "s0", "s1",
+        "s2", "s3", "s4", "s5", "s6", "s7", "t8", "t9", "k0", "k1", "gp", "sp", "fp", "ra",
+    ];
+    for row in 0..8 {
+        let line: Vec<String> = (row * 4..row * 4 + 4).map(|r| format!("{:>4} {:08X}", NAMES[r], psx.cpu.reg(r))).collect();
+        eprintln!("{}", line.join("  "));
+    }
     let (width, height) = psx.bus.gpu.display_size();
     eprintln!(
         "GPU: {} GP0 words, display {width}x{height}, VRAM hash {:016x}",
@@ -370,7 +448,7 @@ fn cmd_run(bios: &str, exe: Option<&String>, options: RunOptions) -> ExitCode {
         }
     }
 
-    if let Err(e) = options.write_pictures(&psx) {
+    if let Err(e) = options.write_pictures(&psx).and_then(|()| options.save_card(&psx)) {
         return fail(e);
     }
 
@@ -427,9 +505,12 @@ fn cmd_vram_hash(bios: &str, exe: &str, options: RunOptions) -> ExitCode {
         Ok(booted) => booted,
         Err(e) => return fail(e),
     };
+    if let Err(e) = options.plug_devices(&mut psx) {
+        return fail(e);
+    }
     run(&mut psx, start, &options, None, false);
     println!("{:016x}  {exe}", image::vram_hash(psx.bus.gpu.vram()));
-    if let Err(e) = options.write_pictures(&psx) {
+    if let Err(e) = options.write_pictures(&psx).and_then(|()| options.save_card(&psx)) {
         return fail(e);
     }
 
@@ -493,12 +574,14 @@ fn cmd_suite(bios: &str, dir: &str, options: RunOptions) -> ExitCode {
         let verdict = if log.is_file() {
             read_reference(&log).and_then(|expected| {
                 let (mut psx, start) = boot(&bios_data, Some(exe))?;
+                options.plug_devices(&mut psx)?;
                 let captured = run(&mut psx, start, &options, Some(&expected), false);
                 Ok(judge(&expected, &normalize(&captured)))
             })
         } else {
             Rgb::read_png(&exe.with_file_name(REFERENCE_VRAM)).and_then(|reference| {
                 let (mut psx, start) = boot(&bios_data, Some(exe))?;
+                options.plug_devices(&mut psx)?;
                 run(&mut psx, start, &options, None, false);
                 judge_vram(&reference, &psx, None)
             })

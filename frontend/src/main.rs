@@ -4,12 +4,14 @@
 //! VRAM, in a desktop window. The emulation itself lives in the core crates;
 //! this crate only moves bytes: files in, pixels out.
 //!
-//! No input devices yet (controllers are Phase 5), and no speed regulation
-//! beyond the window's 60 Hz refresh: one emulated frame per window update.
+//! The keyboard plays a digital pad in port 1, and a file can back a memory
+//! card in slot 1. There is no speed regulation beyond the window's 60 Hz
+//! refresh: one emulated frame per window update.
 
 use minifb::{Key, KeyRepeat, Window, WindowOptions};
 use psx_core::exe::Exe;
 use psx_core::gpu::{rgb15_to_24, VRAM_HEIGHT, VRAM_WIDTH};
+use psx_core::sio::{button, DigitalPad, MemoryCard};
 use psx_core::Psx;
 use std::io::Write;
 use std::process::ExitCode;
@@ -23,12 +25,16 @@ const MAX_CYCLES_PER_UPDATE: u64 = 1_000_000;
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: yu-emulator <bios.bin> [program.exe] [--vram] [--frames N]\n\n  \
+        "usage: yu-emulator <bios.bin> [program.exe] [--vram] [--card FILE] [--frames N]\n\n  \
          <bios.bin>     PlayStation BIOS image (512 KB)\n  \
          [program.exe]  PS-EXE to run instead of the BIOS shell\n  \
          --vram         start with the whole 1024x512 VRAM instead of the display\n  \
+         --card FILE    memory card in slot 1: a raw 128 KB image, created formatted if\n                 \
+         missing and written back on exit if it changed\n  \
          --frames N     quit after N window updates (for automated checks)\n\n\
-         keys: Tab switches between display and VRAM, Esc quits"
+         keys: Tab switches between display and VRAM, Esc quits\n\
+         pad:  arrows = d-pad, Enter = START, Backspace = SELECT,\n      \
+         Z = cross, X = circle, A = square, S = triangle, Q/W = L1/R1, 1/2 = L2/R2"
     );
     ExitCode::from(2)
 }
@@ -38,17 +44,19 @@ struct Options {
     exe: Option<String>,
     show_vram: bool,
     frames: Option<u64>,
+    card: Option<String>,
 }
 
 impl Options {
     fn parse(args: &[String]) -> Option<Self> {
         let mut positional = Vec::new();
-        let mut options = Self { bios: String::new(), exe: None, show_vram: false, frames: None };
+        let mut options = Self { bios: String::new(), exe: None, show_vram: false, frames: None, card: None };
         let mut args = args.iter();
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--vram" => options.show_vram = true,
                 "--frames" => options.frames = Some(args.next()?.parse().ok()?),
+                "--card" => options.card = Some(args.next()?.clone()),
                 flag if flag.starts_with("--") => return None,
                 _ => positional.push(arg.clone()),
             }
@@ -63,6 +71,31 @@ impl Options {
         }
         Some(options)
     }
+}
+
+/// Keyboard keys and the pad buttons they hold down.
+const KEYS: [(Key, u16); 16] = [
+    (Key::Up, button::UP),
+    (Key::Down, button::DOWN),
+    (Key::Left, button::LEFT),
+    (Key::Right, button::RIGHT),
+    (Key::Enter, button::START),
+    (Key::Backspace, button::SELECT),
+    (Key::Z, button::CROSS),
+    (Key::X, button::CIRCLE),
+    (Key::A, button::SQUARE),
+    (Key::S, button::TRIANGLE),
+    (Key::Q, button::L1),
+    (Key::W, button::R1),
+    (Key::Key1, button::L2),
+    (Key::Key2, button::R2),
+    (Key::E, button::L3),
+    (Key::R, button::R3),
+];
+
+/// The pad buttons held by the given set of pressed keys.
+fn pad_buttons(is_down: impl Fn(Key) -> bool) -> u16 {
+    KEYS.iter().filter(|(key, _)| is_down(*key)).fold(0, |mask, (_, bit)| mask | bit)
 }
 
 /// A picture in the window's pixel format (0x00RRGGBB per pixel).
@@ -118,7 +151,25 @@ fn boot(options: &Options) -> Result<Psx, String> {
         psx.take_tty();
         psx.sideload(&exe);
     }
+    psx.bus.sio0.ports[0].pad = Some(DigitalPad::default());
+    if let Some(path) = &options.card {
+        let card = match std::fs::read(path) {
+            Ok(data) => MemoryCard::new(data).ok_or_else(|| format!("{path}: a memory card image must be 131072 bytes"))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => MemoryCard::formatted(),
+            Err(e) => return Err(format!("could not read {path}: {e}")),
+        };
+        psx.bus.sio0.ports[0].card = Some(card);
+    }
     Ok(psx)
+}
+
+/// Writes the memory card back to its file if the program changed it.
+fn save_card(options: &Options, psx: &Psx) -> Result<(), String> {
+    let (Some(path), Some(card)) = (&options.card, &psx.bus.sio0.ports[0].card) else { return Ok(()) };
+    if card.dirty {
+        std::fs::write(path, card.data()).map_err(|e| format!("could not write {path}: {e}"))?;
+    }
+    Ok(())
 }
 
 fn main() -> ExitCode {
@@ -153,6 +204,9 @@ fn main() -> ExitCode {
         if window.is_key_pressed(Key::Tab, KeyRepeat::No) {
             show_vram = !show_vram;
         }
+        if let Some(pad) = psx.bus.sio0.ports[0].pad.as_mut() {
+            pad.pressed = pad_buttons(|key| window.is_key_down(key));
+        }
         run_frame(&mut psx, &mut stdout.lock());
         let picture = if show_vram { vram_picture(&psx) } else { display_picture(&psx) };
         if let Err(e) = window.update_with_buffer(&picture.pixels, picture.width, picture.height) {
@@ -163,6 +217,10 @@ fn main() -> ExitCode {
         if options.frames.is_some_and(|limit| updates >= limit) {
             break;
         }
+    }
+    if let Err(e) = save_card(&options, &psx) {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
 }
@@ -179,12 +237,49 @@ mod tests {
     fn parses_arguments() {
         let o = Options::parse(&args(&["bios.bin"])).unwrap();
         assert_eq!((o.bios.as_str(), o.exe, o.show_vram, o.frames), ("bios.bin", None, false, None));
-        let o = Options::parse(&args(&["--vram", "bios.bin", "--frames", "3", "game.exe"])).unwrap();
+        let o = Options::parse(&args(&["--vram", "bios.bin", "--frames", "3", "game.exe", "--card", "a.mcd"])).unwrap();
         assert_eq!((o.exe.as_deref(), o.show_vram, o.frames), (Some("game.exe"), true, Some(3)));
+        assert_eq!(o.card.as_deref(), Some("a.mcd"));
         assert!(Options::parse(&args(&[])).is_none());
         assert!(Options::parse(&args(&["a", "b", "c"])).is_none());
         assert!(Options::parse(&args(&["a", "--frames"])).is_none());
         assert!(Options::parse(&args(&["a", "--unknown"])).is_none());
+    }
+
+    #[test]
+    fn keys_map_to_pad_buttons() {
+        assert_eq!(pad_buttons(|_| false), 0);
+        assert_eq!(pad_buttons(|key| key == Key::Enter || key == Key::Z), button::START | button::CROSS);
+        assert_eq!(pad_buttons(|_| true), 0xFFFF, "every button has a key");
+    }
+
+    #[test]
+    fn memory_card_file_is_created_and_saved_when_changed() {
+        let path = std::env::temp_dir().join(format!("yu-emulator-card-{}.mcd", std::process::id()));
+        let bios = std::env::temp_dir().join(format!("yu-emulator-bios-{}.bin", std::process::id()));
+        std::fs::write(&bios, vec![0u8; psx_core::map::BIOS_SIZE]).unwrap();
+        let options = Options {
+            bios: bios.display().to_string(),
+            exe: None,
+            show_vram: false,
+            frames: None,
+            card: Some(path.display().to_string()),
+        };
+        let mut psx = boot(&options).unwrap();
+        assert!(psx.bus.sio0.ports[0].pad.is_some());
+        // Unchanged card: nothing is written.
+        save_card(&options, &psx).unwrap();
+        assert!(!path.exists());
+        // Changed card: the 128 KB image is written.
+        psx.bus.sio0.ports[0].card.as_mut().unwrap().dirty = true;
+        save_card(&options, &psx).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 131072);
+        // And loaded again; a file of the wrong size is refused.
+        assert!(boot(&options).is_ok());
+        std::fs::write(&path, [0u8; 10]).unwrap();
+        assert!(boot(&options).is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&bios).unwrap();
     }
 
     #[test]

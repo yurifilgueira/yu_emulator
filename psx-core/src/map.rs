@@ -74,6 +74,10 @@ pub const EXPANSION_2: Range = Range::new(0x1F80_2000, 0x2000);
 /// psx-spx: "Memory Map". Nothing connected on a retail console.
 pub const EXPANSION_3: Range = Range::new(0x1FA0_0000, 2 * 1024 * 1024);
 
+/// SIO0, the controller and memory card port.
+/// psx-spx: "Serial Interfaces (SIO)" (1F801040h..1F80104Fh).
+pub const SIO0: Range = Range::new(0x1F80_1040, 0x10);
+
 /// SPU registers. psx-spx: "SPU I/O Port Summary" (1F801C00h..1F801FFFh).
 pub const SPU: Range = Range::new(0x1F80_1C00, 0x400);
 
