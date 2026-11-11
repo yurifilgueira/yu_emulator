@@ -77,12 +77,27 @@ them pass and are recorded in `DEVLOG.md`.
   parameters at the index checked). Running `gte-fuzz` itself is listed
   under Phase 5.
 
-## Phase 5 — Controllers and memory cards (SIO0)
+## Phase 5 — Controllers and memory cards (SIO0) ✅ (Sony BIOS menu and card manager not verifiable yet)
 
+- [x] SIO0 port: registers, byte timing, /ACK and IRQ7
+- [x] Digital pad; keyboard mapping in the frontend, scripted input in the harness
+- [x] Memory card: read, write and get-ID commands; card image files
 - **Accept:** BIOS menu is navigable with a pad; memory card manager works;
   amidog's `psxtest_cpx` runs from its menu and shows all tests passing
   (carried over from Phases 1-3); ps1-tests `gte-fuzz`, started from its
   menu, reproduces its console log (carried over from Phase 4).
+  Status on 2026-11-11, OpenBIOS:
+  - amidog `psxtest_cpx`: started with a scripted START press, every group
+    (exception, interrupt, slot, slot branch, break, illegal) is OK and it
+    prints no mismatch. Its first run printed 4567; fixing them is part of
+    this phase.
+  - ps1-tests `gte-fuzz`: started with a scripted START press, its output
+    contains all 149,475 lines of the console log, in order.
+  - ps1-tests `input/pad` reports the scripted buttons.
+  - BIOS menu and memory card manager: these are Sony's shell. Not run: no
+    Sony BIOS is available, and OpenBIOS has neither a menu nor memory card
+    functions. The memory card is only covered by unit tests written from
+    psx-spx; no program has read or written one.
 
 ## Phase 6 — CD-ROM
 

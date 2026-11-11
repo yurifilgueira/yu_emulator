@@ -17,6 +17,100 @@ Model: claude-fable-5-2 · Session time: Xh · Human interventions: N
 
 ---
 
+## 2026-11-11 — Phase 5: controllers, memory cards, and what amidog's CPX found
+
+Model: claude-fable-5-2 · Session time: ~3h across two days (estimate, not measured) · Human interventions: 1
+
+- Done (branch `phase-5-controllers`, pull request, not on `main`):
+  - `psx-core/src/sio.rs`: SIO0 registers with byte timing from the baud
+    rate, RX FIFO, /ACK pulse and IRQ7; a digital pad; a 128 KB memory card
+    (read, write, get-ID, new-card flag, formatted image). Nothing is
+    plugged in by default.
+  - CPU: COP0 hardware breakpoints, and four corrections to exception
+    behaviour (below).
+  - Harness: a pad in port 1, `--press BUTTON@FRAME[+LENGTH]`, `--card`,
+    `--trace-pc LO-HI`, and a register dump in the final report.
+  - Frontend: keyboard as a pad, `--card`.
+  - 240 unit tests (224 core, 11 harness, 5 frontend).
+- Results (OpenBIOS):
+  - amidog `psxtest_cpx`, started by a scripted START: all six groups OK
+    on its result screen (read by eye from a screenshot) and no mismatch
+    line on the TTY (0 lines containing "got"; the first run had 4567).
+  - amidog `psxtest_cpu`: same VRAM hash as the all-green Phase 3 run
+    (`91bcaf744e265cac`), so still all OK after the CPU changes.
+  - ps1-tests `gte-fuzz`, started by a scripted START: PASS. Its output
+    contains all 149,475 lines of the console log in order, plus two
+    banner lines the log lacks. It needed 1.05 billion cycles; my first
+    attempt, given 4 billion, I stopped by mistake believing the budget was
+    too small (I had misjudged how long it had been running), so the test
+    ran twice.
+  - ps1-tests `input/pad` prints `PAD_UP` and `PAD_X` for those presses
+    (this one uses the SDK's interrupt-driven driver; amidog polls).
+  - `harness suite`: 16 of 32, unchanged.
+- **What amidog's CPX found in the CPU.** Until now only ps1-tests' 24
+  assertions and amidog's basic test had judged the interpreter. CPX is the
+  first hard check, and it found things in code I had called done in
+  Phase 1:
+  1. COP0 breakpoints did nothing ("stored but never trigger", I wrote
+     then). Most of the 4567 mismatches.
+  2. Interrupt timing. Phase 1 took an interrupt before the instruction
+     following the MTC0 that enabled or raised it. On hardware a change of
+     SR is seen one instruction late; a change of CAUSE at once.
+  3. CAUSE.CE is bits 26-27 of the faulting instruction for address errors
+     and reserved instructions too; psx-spx only mentions coprocessor
+     unusable.
+  4. TAR is also written for an untaken branch.
+  5. LWCn/SWCn of an enabled COP0/1/3 still raise address and bus errors.
+     In Phase 2 I made them do nothing, on the strength of a test that
+     only tried valid addresses.
+- Deviations from psx-spx that the test forced (all commented in `cpu.rs`):
+  - DCIC bits 29/30 ("break in kernel/user mode") select by the address
+    being compared, not by the CPU mode.
+  - Priorities: address error, then breakpoint, then bus error; a match
+    sets the DCIC status bits even when the address error wins.
+  - The address compared for LWL/SWL is the aligned one, for LWR/SWR the
+    address itself (the lowest byte each touches).
+- Broke / surprised us (my mistakes):
+  - **Three Phase 1 unit tests were wrong and I changed them.** They
+    asserted that an interrupt is taken at once; I had derived that from
+    my own reading, not from a test on hardware. Rule 2 says never weaken
+    a test to make it pass; these were replaced because hardware evidence
+    contradicts them, and the new versions are stricter (they pin the
+    exact EPC for both orders of the two MTC0s).
+  - It took three rounds, not one. My first interrupt fix delayed
+    everything by one instruction: the four failing cases passed and four
+    others started failing. Only then did I trace the test's code
+    (`--trace-pc`) and see the two orders of "mtc0 sr" / "mtc0 cause". My
+    first CE fix applied it to every exception, the second to too few.
+    Each round was guided by the suite's "got / wanted" lines, grouped by
+    which fields differ with a throwaway script.
+  - I pressed START too early. The program spends its first ~250M cycles
+    clearing VRAM one pixel at a time; I sampled it at 60-80M, saw no
+    controller traffic and briefly suspected the pad code. A register dump
+    of the loop showed what it was doing.
+  - I killed my own shell: `pkill -f target/release/harness` matches the
+    command line of the shell running it. The edits queued after it in
+    the same command never ran, and a debug `eprintln!` stayed in
+    `cpu.rs` across a break in the session. It was not committed (I
+    checked for it before every commit), but only by that check.
+  - One debug run printed a line for every data access and did not finish
+    in 10 minutes; I stopped it and restricted the print.
+  - Two unit tests I wrote this phase had wrong expectations of my own
+    (a load that I expected not to happen; a status field that hardware
+    does set).
+- Not done / cannot be verified here:
+  - **The memory card has never been used by a program.** Its protocol is
+    unit-tested from psx-spx only. OpenBIOS has no memory card functions
+    ("Unimplemented memory card function" is in its strings) and none of
+    the test programs touch one.
+  - BIOS menu with a pad, memory card manager: Sony's shell; no Sony BIOS.
+  - Analog pads, multitaps, other controllers, SIO1, the TX interrupt, the
+    31000-cycle delay of Sony cards.
+- Human stepped in for: merging pull request #2.
+- Next: Phase 6, CD-ROM. A Sony BIOS would close the open criteria of
+  Phases 3 and 5 and is close to a requirement for Phase 6's "PlayStation
+  logo boot sequence".
+
 ## 2026-11-10 — Phase 4: GTE
 
 Model: claude-fable-5-2 · Session time: ~45 min (estimate, not measured) · Human interventions: 2
