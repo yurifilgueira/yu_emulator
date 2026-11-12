@@ -49,8 +49,8 @@ impl Psx {
         // psx-spx: "Interrupts" — cop0r13.bit10 follows I_STAT & I_MASK.
         self.cpu.set_irq(self.bus.irq.pending());
         self.cpu.step(&mut self.bus);
-        // One cycle per instruction (see cpu.rs), plus the time the CPU was
-        // held off the bus by DMA.
+        // One cycle per instruction (see cpu.rs), plus the time the CPU
+        // spent waiting for its memory reads and for DMA.
         let cycles = 1 + self.bus.take_stall();
         self.cycles += cycles as u64;
         self.bus.tick(cycles);
@@ -183,7 +183,8 @@ mod tests {
         let mut psx = Psx::new(bios(&[0x3C08_8003, 0x0100_0008, 0])).unwrap();
         assert!(psx.run_to_shell(100));
         assert_eq!(psx.cpu.pc(), SHELL_ENTRY);
-        assert_eq!(psx.cycles(), 3);
+        // Three instructions fetched from the uncached ROM: 25 cycles each.
+        assert_eq!(psx.cycles(), 75);
 
         // A BIOS that never gets there: j self.
         let mut psx = Psx::new(bios(&[0x0BF0_0000, 0])).unwrap();

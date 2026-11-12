@@ -13,7 +13,7 @@ mistakes) and the roadmap with acceptance criteria for each phase.
 |------------------|--------|------------|
 | Bus / memory map | ✅     | unit tests |
 | CPU (R3000A)     | ✅ boots the BIOS; amidog `psxtest_cpu` and `psxtest_cpx` all OK | unit tests, ps1-tests `cpu/cop`, `cpu/code-in-io`, amidog |
-| Interrupts / DMA / timers | ✅ functional, not cycle-exact | unit tests, ps1-tests `dma/otc-test`, `dma/dpcr` |
+| Interrupts / DMA / timers | ✅ functional, not cycle-exact; Sony BIOS (SCPH1001) boots to its logo | unit tests, ps1-tests `dma/otc-test`, `dma/dpcr` |
 | GPU              | ✅ software rasteriser; 9 of 11 ps1-tests VRAM references match exactly | unit tests, ps1-tests `gpu/*` |
 | GTE              | ✅ all commands, flags, inexact division | unit tests, ps1-tests `gte/test-all` (1150/1150) |
 | Controllers / memory cards | ✅ digital pad; memory card untested by any program | unit tests, ps1-tests `input/pad`, programs driven through their menus |
@@ -49,7 +49,7 @@ cargo run --release -p psx-harness -- suite bios/your-bios.bin tests/ps1-tests
 cargo run --release -p frontend -- bios/your-bios.bin [program.exe]
 ```
 
-`cargo test` runs 240 unit tests and needs no BIOS. The test programs are not
+`cargo test` runs 243 unit tests and needs no BIOS. The test programs are not
 in the repository: unpack the [ps1-tests](https://github.com/JaCzekanski/ps1-tests/releases)
 release into `tests/ps1-tests/` and amidog's CPU tests into `tests/amidog/`
 (both gitignored). Currently 16 of the 32 ps1-tests programs that have a

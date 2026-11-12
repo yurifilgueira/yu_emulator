@@ -308,7 +308,9 @@ mod tests {
         assert_eq!(psx.bus.gpu.video.frame(), 1);
         // One NTSC frame: 263 lines of 3413 video cycles at 11/7 per CPU cycle.
         let expected = 263 * 3413 * 7 / 11;
-        assert!(psx.cycles().abs_diff(expected) <= 1, "{} cycles", psx.cycles());
+        // Instructions in the BIOS ROM take 25 cycles each, so the frame is
+        // overshot by at most one of them.
+        assert!(psx.cycles().abs_diff(expected) <= 25, "{} cycles", psx.cycles());
         assert!(tty.is_empty());
     }
 }

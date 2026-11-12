@@ -3,10 +3,10 @@
 //!
 //! psx-spx: "CPU Specifications"
 //!
-//! One call to [`Cpu::step`] executes exactly one instruction. Timing is not
-//! modelled yet: every instruction counts as one cycle (psx-spx documents
-//! longer mul/div and memory access times; that is deferred until the timers
-//! of Phase 2 need it).
+//! One call to [`Cpu::step`] executes exactly one instruction. Every
+//! instruction counts as one cycle, plus the time of its memory reads and,
+//! for uncached code, of its fetch (see `Bus::read_delay`). The longer
+//! mul/div and GTE command times that psx-spx documents are not modelled.
 //!
 //! Two pipeline effects are modelled because software depends on them:
 //!
@@ -378,6 +378,14 @@ impl Cpu {
         }
         // Unused regions bus-error on fetch as well.
         let word = bus.load32(pc).map_err(|_| Exception::BusFetch)?;
+        // Code in KSEG1 is not cached (psx-spx: "KUSEG,KSEG0,KSEG1,KSEG2
+        // Memory Regions"), so every instruction there costs a full read of
+        // the bus: the BIOS ROM runs about 25 times slower than cached
+        // code. Deviation: the i-cache itself is not emulated, so cached
+        // code never pays for a miss.
+        if pc >> 29 == 0b101 {
+            bus.charge_read(pc, Width::Word);
+        }
         self.last_instr = word;
         self.opcode_cop = (word >> 26) & 3;
 
@@ -560,7 +568,9 @@ impl Cpu {
         if self.cache_isolated() {
             return Ok(0);
         }
-        bus.load32(addr & !3).map_err(|_| Exception::BusData)
+        let value = bus.load32(addr & !3).map_err(|_| Exception::BusData)?;
+        bus.charge_read(addr, Width::Word);
+        Ok(value)
     }
 
     fn store_aligned_word(&mut self, bus: &mut Bus, addr: u32, value: u32) -> Result<(), Exception> {
@@ -584,7 +594,9 @@ impl Cpu {
         if self.cache_isolated() {
             return Ok(0);
         }
-        bus.load8(addr).map_err(|_| Exception::BusData)
+        let value = bus.load8(addr).map_err(|_| Exception::BusData)?;
+        bus.charge_read(addr, Width::Byte);
+        Ok(value)
     }
 
     fn load16(&mut self, bus: &mut Bus, addr: u32) -> Result<u16, Exception> {
@@ -592,7 +604,9 @@ impl Cpu {
         if self.cache_isolated() {
             return Ok(0);
         }
-        bus.load16(addr).map_err(|_| Exception::BusData)
+        let value = bus.load16(addr).map_err(|_| Exception::BusData)?;
+        bus.charge_read(addr, Width::Half);
+        Ok(value)
     }
 
     fn load32(&mut self, bus: &mut Bus, addr: u32) -> Result<u32, Exception> {
@@ -600,7 +614,9 @@ impl Cpu {
         if self.cache_isolated() {
             return Ok(0);
         }
-        bus.load32(addr).map_err(|_| Exception::BusData)
+        let value = bus.load32(addr).map_err(|_| Exception::BusData)?;
+        bus.charge_read(addr, Width::Word);
+        Ok(value)
     }
 
     /// Stores take the whole register even for narrow widths: psx-spx
@@ -2184,6 +2200,25 @@ mod tests {
         m.steps(1);
         assert_eq!(m.cpu.reg(5), 9);
         assert_eq!(m.cpu.pc(), VECTOR_GENERAL_RAM + 4);
+    }
+
+    #[test]
+    fn memory_reads_cost_time() {
+        // Bus::read_delay: a RAM load takes 4 cycles beyond the instruction.
+        let mut m = with_data(0, &[lw(2, 1, 0), NOP]);
+        m.steps(1);
+        assert_eq!(m.bus.take_stall(), 4);
+        m.steps(1);
+        assert_eq!(m.bus.take_stall(), 0, "cached code, no memory access");
+        // A faulting load is not charged.
+        let mut m = with_data(0, &[lw(2, 1, 1)]);
+        m.steps(1);
+        assert_eq!(m.bus.take_stall(), 0);
+        // Code in KSEG1 pays for every fetch: 4 cycles in RAM.
+        let mut m = Machine::new(&[NOP]);
+        m.cpu.set_pc(BASE | 0xA000_0000);
+        m.steps(1);
+        assert_eq!(m.bus.take_stall(), 4);
     }
 
     #[test]
