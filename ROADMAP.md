@@ -53,8 +53,9 @@ them pass and are recorded in `DEVLOG.md`.
   `psxtest_cpx` show all tests passing (carried over from Phases 1-2).
   Status on 2026-11-10, OpenBIOS:
   - BIOS shell: OpenBIOS's shell (a rotating cube, 640x480 interlaced)
-    renders. The memory card / CD player menu is Sony's shell and has not
-    been run: no Sony BIOS is available here.
+    renders. Update 2026-11-11: with a Sony BIOS (SCPH1001) the Sony logo
+    screen renders, but the memory card / CD player menu is not reached:
+    the BIOS waits for the CD-ROM drive (Phase 6).
   - ps1-tests GPU programs with a `vram.png`: 9 of 11 match every pixel of
     VRAM (`clipping`, `clut-cache`, `quad`, `rectangles`, `texture-flip`,
     `texture-overflow`, `triangle`, `uv-interpolation`,

@@ -17,6 +17,67 @@ Model: claude-fable-5-2 · Session time: Xh · Human interventions: N
 
 ---
 
+## 2026-11-11 — Sony BIOS: timing fixes
+
+Model: claude-fable-5-2 · Session time: ~1h (estimate, not measured) · Human interventions: 2
+
+- Context: the owner added a Sony BIOS (`bios/SCPH1001.BIN`, SHA-1
+  `10155d8d6e6e832d6ea66db9bc098321fb5e8ebf`) and ran the frontend on a
+  second machine (Windows, Ryzen 5 5600), where 600 frames took 11.4 s:
+  full speed, against roughly a third on the development notebook
+  (Ryzen 5 5500U). On both, the BIOS drew a striped Sony logo and printed
+  "VSync: timeout" every frame and "GPU timeout" now and then.
+- Done (branch `sony-bios-timing`, pull request):
+  - CPU reads and uncached instruction fetches now cost the access times a
+    console measures (`Bus::read_delay`, from ps1-tests `cpu/access-time`).
+  - GPU linked-list DMA advances 64 nodes per CPU instruction instead of 1.
+  - The harness report shows I_STAT, I_MASK and the video position.
+  - 243 unit tests (227 core, 11 harness, 5 frontend).
+- Results:
+  - Sony BIOS: no timeout messages in 1.2 billion cycles; the logo screen
+    is clean. It then stays on the logo: I_MASK shows it has enabled the
+    CD-ROM interrupt and is waiting for a drive that does not exist yet.
+    So the BIOS menu is still not reached; that needs Phase 6.
+  - No regressions: `harness suite` 16 of 32 as before; amidog
+    `psxtest_cpu` gives the same VRAM hash; `psxtest_cpx` prints no
+    mismatch.
+- What was wrong, and how it was found:
+  - "VSync: timeout". The vblank interrupt was arriving (the counter in
+    the message went up by one each time), so it was not a missing
+    interrupt. The BIOS waits in a loop that counts iterations, and with
+    every instruction costing one cycle the loop ran out before the
+    vblank. This is the "known gap" I had listed since Phase 1 ("every
+    instruction is one cycle"); it took a real BIOS to turn it into a bug.
+  - "GPU timeout" and the stripes were one bug. A linked list reached
+    address 0 and looped forever. A ring buffer of the last nodes showed a
+    primitive with a zero link: the BIOS reuses primitive memory for the
+    next frame right after starting the transfer, and my Phase 2 design
+    (one node per instruction, chosen so an endless list could not hang
+    the emulator) let the CPU overtake the list. I had read psx-spx's "CPU
+    operation resumes ... after SyncMode 2 list entries" as "the CPU keeps
+    running" and missed the sentence before it: any RAM read stalls the
+    CPU until the DMA is done.
+  - A wrong lead: the first clue was 900 million GP0 words, and I spent
+    three debug runs looking at ordinary lists before logging only lists
+    that had gone 300,000 nodes without ending.
+- Still approximate:
+  - No i-cache: cached code never pays for a miss.
+  - Access times are fixed values, not computed from the memory control
+    registers; mul/div and GTE command durations are still one cycle.
+  - 64 nodes per instruction is a guess that works. On hardware
+    `dma/chain-looping` shows the CPU at about 60% speed during an endless
+    list; here it gets one instruction per 64 nodes.
+  - `timers`, `cpu/access-time`, `dma/chain-looping` still do not match
+    their logs; I did not re-examine how close they are now.
+- Human stepped in for: providing the Sony BIOS and testing on a second
+  machine; telling me to stop ("agora não") when I started this fix before
+  being asked, then to proceed.
+- Also: the owner put a game archive in `roms-for-test/`, which was not
+  gitignored. I added the folder and `*.7z`/`*.zip` to `.gitignore` in the
+  Phase 5 branch before any `git add -A` could stage 368 MB.
+- Next: Phase 6, CD-ROM. The BIOS now waits on it, and a game image is
+  available to test with.
+
 ## 2026-11-11 — Phase 5: controllers, memory cards, and what amidog's CPX found
 
 Model: claude-fable-5-2 · Session time: ~3h across two days (estimate, not measured) · Human interventions: 1
