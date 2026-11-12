@@ -58,6 +58,7 @@ fn usage() -> ExitCode {
          each like `exe --expect` / `vram-hash --expect`, and print a table; exit 0 only\n      \
          if all of them pass\n\n\
          pictures: [--vram-out <png>] writes the whole VRAM, [--frame-out <png>] the displayed picture\n\
+         sound: [--audio-out <wav>] writes what the SPU played (16-bit stereo, 44100 Hz)\n\
          devices (run, exe, vram-hash): a digital pad is plugged into port 1.\n  \
          --press BUTTON[+BUTTON]@FRAME[+LENGTH]  hold buttons from a video frame of the run\n      \
          (repeatable; buttons: select start up right down left l1 l2 r1 r2 triangle circle cross square)\n  \
@@ -133,6 +134,10 @@ struct RunOptions {
     trace_pc: Option<(u32, u32)>,
     expect: Option<String>,
     vram_out: Option<String>,
+    /// --audio-out: WAV file for the SPU's output, and the samples collected
+    /// for it during the run.
+    audio_out: Option<String>,
+    audio: std::cell::RefCell<Vec<[i16; 2]>>,
     frame_out: Option<String>,
     diff_out: Option<String>,
     /// --region X,Y,W,H: the part of VRAM that vram-hash --expect compares.
@@ -154,6 +159,8 @@ impl RunOptions {
             trace_pc: None,
             expect: None,
             vram_out: None,
+            audio_out: None,
+            audio: Default::default(),
             frame_out: None,
             diff_out: None,
             region: None,
@@ -178,6 +185,7 @@ impl RunOptions {
                 }
                 "--expect" => options.expect = Some(args.next()?.clone()),
                 "--vram-out" => options.vram_out = Some(args.next()?.clone()),
+                "--audio-out" => options.audio_out = Some(args.next()?.clone()),
                 "--frame-out" => options.frame_out = Some(args.next()?.clone()),
                 "--diff-out" => options.diff_out = Some(args.next()?.clone()),
                 "--card" => options.card = Some(args.next()?.clone()),
@@ -201,7 +209,7 @@ impl RunOptions {
 
     /// Only --cycles was given.
     fn is_plain(&self) -> bool {
-        let paths = [&self.expect, &self.vram_out, &self.frame_out, &self.diff_out];
+        let paths = [&self.expect, &self.vram_out, &self.frame_out, &self.diff_out, &self.audio_out];
         let no_devices = self.card.is_none() && self.disc.is_none() && self.script == input::Script::default();
         !self.trace && self.region.is_none() && no_devices && paths.iter().all(|o| o.is_none())
     }
@@ -232,8 +240,12 @@ impl RunOptions {
         Ok(())
     }
 
-    /// Writes the pictures requested with --vram-out / --frame-out.
+    /// Writes the pictures requested with --vram-out / --frame-out and the
+    /// sound requested with --audio-out.
     fn write_pictures(&self, psx: &Psx) -> Result<(), String> {
+        if let Some(path) = &self.audio_out {
+            std::fs::write(path, wav(&self.audio.borrow())).map_err(|e| format!("could not write {path}: {e}"))?;
+        }
         if let Some(path) = &self.vram_out {
             Rgb::from_vram(psx.bus.gpu.vram()).write_png(Path::new(path))?;
         }
@@ -256,6 +268,27 @@ fn load_disc(path: &str) -> Result<Disc, String> {
     } else {
         Disc::from_data_track(read(path)?).map_err(|e| format!("{}: {e}", path.display()))
     }
+}
+
+/// A WAV file: 16-bit PCM, stereo, at the SPU's 44100 Hz.
+fn wav(samples: &[[i16; 2]]) -> Vec<u8> {
+    let data_bytes = (samples.len() * 4) as u32;
+    let rate = psx_core::spu::SAMPLE_RATE;
+    let mut file = Vec::with_capacity(44 + data_bytes as usize);
+    file.extend(b"RIFF");
+    file.extend((36 + data_bytes).to_le_bytes());
+    file.extend(b"WAVEfmt ");
+    file.extend(16u32.to_le_bytes()); // size of the format chunk
+    file.extend(1u16.to_le_bytes()); // PCM
+    file.extend(2u16.to_le_bytes()); // channels
+    file.extend(rate.to_le_bytes());
+    file.extend((rate * 4).to_le_bytes()); // bytes per second
+    file.extend(4u16.to_le_bytes()); // bytes per stereo sample
+    file.extend(16u16.to_le_bytes()); // bits per sample
+    file.extend(b"data");
+    file.extend(data_bytes.to_le_bytes());
+    file.extend(samples.iter().flatten().flat_map(|s| s.to_le_bytes()));
+    file
 }
 
 // ---- reference logs -------------------------------------------------------
@@ -385,6 +418,10 @@ fn run(psx: &mut Psx, start: u64, options: &RunOptions, expected: Option<&[Strin
             if let Some(pad) = psx.bus.sio0.ports[0].pad.as_mut() {
                 pad.pressed = options.script.pressed(frame);
             }
+            // Sound is collected once per frame (the SPU keeps a second).
+            if options.audio_out.is_some() {
+                options.audio.borrow_mut().extend(psx.bus.spu.take_samples());
+            }
         }
         psx.step();
         if options.trace && psx.cycles() - start >= options.trace_from {
@@ -409,6 +446,9 @@ fn run(psx: &mut Psx, start: u64, options: &RunOptions, expected: Option<&[Strin
                 break;
             }
         }
+    }
+    if options.audio_out.is_some() {
+        options.audio.borrow_mut().extend(psx.bus.spu.take_samples());
     }
     captured
 }
@@ -688,5 +728,17 @@ mod tests {
         // Order matters, and a changed value is still a failure.
         assert!(!judge(&expected, &lines("Failed tests: 0\nPassed tests: 1150\nDone.")).pass);
         assert!(!judge(&expected, &lines("Passed tests: 969\nFailed tests: 1\nDone.")).pass);
+    }
+
+    #[test]
+    fn wav_file_layout() {
+        let file = wav(&[[1, -1], [0x1234, 0]]);
+        assert_eq!(file.len(), 44 + 8);
+        assert_eq!(&file[..4], b"RIFF");
+        assert_eq!(file[4..8], 44u32.to_le_bytes());
+        assert_eq!(&file[8..16], b"WAVEfmt ");
+        assert_eq!(file[22..28], [2, 0, 0x44, 0xAC, 0, 0], "stereo, 44100 Hz");
+        assert_eq!(file[40..44], 8u32.to_le_bytes());
+        assert_eq!(file[44..], [1, 0, 0xFF, 0xFF, 0x34, 0x12, 0, 0]);
     }
 }
