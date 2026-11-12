@@ -260,7 +260,8 @@ mod tests {
     fn parses_arguments() {
         let o = Options::parse(&args(&["bios.bin"])).unwrap();
         assert_eq!((o.bios.as_str(), o.exe, o.show_vram, o.frames), ("bios.bin", None, false, None));
-        let o = Options::parse(&args(&["--vram", "bios.bin", "--frames", "3", "game.exe", "--card", "a.mcd"])).unwrap();
+        let o = Options::parse(&args(&["--vram", "bios.bin", "--frames", "3", "game.exe", "--card", "a.mcd", "--disc", "g.cue"])).unwrap();
+        assert_eq!(o.disc.as_deref(), Some("g.cue"));
         assert_eq!((o.exe.as_deref(), o.show_vram, o.frames), (Some("game.exe"), true, Some(3)));
         assert_eq!(o.card.as_deref(), Some("a.mcd"));
         assert!(Options::parse(&args(&[])).is_none());
@@ -287,6 +288,7 @@ mod tests {
             show_vram: false,
             frames: None,
             card: Some(path.display().to_string()),
+            disc: None,
         };
         let mut psx = boot(&options).unwrap();
         assert!(psx.bus.sio0.ports[0].pad.is_some());
