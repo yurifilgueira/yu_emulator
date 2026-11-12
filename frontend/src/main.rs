@@ -9,11 +9,13 @@
 //! refresh: one emulated frame per window update.
 
 use minifb::{Key, KeyRepeat, Window, WindowOptions};
+use psx_core::disc::Disc;
 use psx_core::exe::Exe;
 use psx_core::gpu::{rgb15_to_24, VRAM_HEIGHT, VRAM_WIDTH};
 use psx_core::sio::{button, DigitalPad, MemoryCard};
 use psx_core::Psx;
 use std::io::Write;
+use std::path::Path;
 use std::process::ExitCode;
 
 /// Cycles the BIOS may take to reach its shell before sideloading gives up.
@@ -25,9 +27,11 @@ const MAX_CYCLES_PER_UPDATE: u64 = 1_000_000;
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: yu-emulator <bios.bin> [program.exe] [--vram] [--card FILE] [--frames N]\n\n  \
+        "usage: yu-emulator <bios.bin> [program.exe] [--disc FILE] [--vram] [--card FILE] [--frames N]\n\n  \
          <bios.bin>     PlayStation BIOS image (512 KB)\n  \
          [program.exe]  PS-EXE to run instead of the BIOS shell\n  \
+         --disc FILE    disc in the drive: a .cue sheet (its .bin files next to it) or\n                 \
+         a single .bin with one data track\n  \
          --vram         start with the whole 1024x512 VRAM instead of the display\n  \
          --card FILE    memory card in slot 1: a raw 128 KB image, created formatted if\n                 \
          missing and written back on exit if it changed\n  \
@@ -45,18 +49,20 @@ struct Options {
     show_vram: bool,
     frames: Option<u64>,
     card: Option<String>,
+    disc: Option<String>,
 }
 
 impl Options {
     fn parse(args: &[String]) -> Option<Self> {
         let mut positional = Vec::new();
-        let mut options = Self { bios: String::new(), exe: None, show_vram: false, frames: None, card: None };
+        let mut options = Self { bios: String::new(), exe: None, show_vram: false, frames: None, card: None, disc: None };
         let mut args = args.iter();
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--vram" => options.show_vram = true,
                 "--frames" => options.frames = Some(args.next()?.parse().ok()?),
                 "--card" => options.card = Some(args.next()?.clone()),
+                "--disc" => options.disc = Some(args.next()?.clone()),
                 flag if flag.starts_with("--") => return None,
                 _ => positional.push(arg.clone()),
             }
@@ -139,9 +145,26 @@ fn run_frame(psx: &mut Psx, tty: &mut impl Write) {
     }
 }
 
+/// Reads a disc image: a .cue sheet and the .bin files it names (looked up
+/// next to the sheet), or a single .bin holding one data track.
+fn load_disc(path: &str) -> Result<Disc, String> {
+    let path = Path::new(path);
+    let read = |file: &Path| std::fs::read(file).map_err(|e| format!("could not read {}: {e}", file.display()));
+    if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("cue")) {
+        let cue = String::from_utf8_lossy(&read(path)?).into_owned();
+        let dir = path.parent().unwrap_or(Path::new("."));
+        Disc::from_cue(&cue, |name| read(&dir.join(name))).map_err(|e| format!("{}: {e}", path.display()))
+    } else {
+        Disc::from_data_track(read(path)?).map_err(|e| format!("{}: {e}", path.display()))
+    }
+}
+
 fn boot(options: &Options) -> Result<Psx, String> {
     let bios = std::fs::read(&options.bios).map_err(|e| format!("could not read {}: {e}", options.bios))?;
     let mut psx = Psx::new(bios).map_err(|e| e.to_string())?;
+    if let Some(path) = &options.disc {
+        psx.bus.cdrom.insert(Some(load_disc(path)?));
+    }
     if let Some(path) = &options.exe {
         let file = std::fs::read(path).map_err(|e| format!("could not read {path}: {e}"))?;
         let exe = Exe::parse(&file).map_err(|e| format!("{path}: {e}"))?;
@@ -237,7 +260,8 @@ mod tests {
     fn parses_arguments() {
         let o = Options::parse(&args(&["bios.bin"])).unwrap();
         assert_eq!((o.bios.as_str(), o.exe, o.show_vram, o.frames), ("bios.bin", None, false, None));
-        let o = Options::parse(&args(&["--vram", "bios.bin", "--frames", "3", "game.exe", "--card", "a.mcd"])).unwrap();
+        let o = Options::parse(&args(&["--vram", "bios.bin", "--frames", "3", "game.exe", "--card", "a.mcd", "--disc", "g.cue"])).unwrap();
+        assert_eq!(o.disc.as_deref(), Some("g.cue"));
         assert_eq!((o.exe.as_deref(), o.show_vram, o.frames), (Some("game.exe"), true, Some(3)));
         assert_eq!(o.card.as_deref(), Some("a.mcd"));
         assert!(Options::parse(&args(&[])).is_none());
@@ -264,6 +288,7 @@ mod tests {
             show_vram: false,
             frames: None,
             card: Some(path.display().to_string()),
+            disc: None,
         };
         let mut psx = boot(&options).unwrap();
         assert!(psx.bus.sio0.ports[0].pad.is_some());

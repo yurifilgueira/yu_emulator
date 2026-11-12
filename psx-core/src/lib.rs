@@ -5,8 +5,10 @@
 //! - Every hardware behaviour cites the psx-spx section it implements.
 
 pub mod bus;
+pub mod cdrom;
 pub mod cpu;
 pub mod disasm;
+pub mod disc;
 pub mod dma;
 pub mod exe;
 pub mod gpu;

@@ -17,6 +17,67 @@ Model: claude-fable-5-2 · Session time: Xh · Human interventions: N
 
 ---
 
+## 2026-11-12 — Phase 6: CD-ROM
+
+Model: claude-fable-5-2 · Session time: ~2h (estimate, not measured; the session was cut once by a usage limit) · Human interventions: 0
+
+- Done (branch `phase-6-cdrom`, pull request):
+  - `psx-core/src/disc.rs`: disc images. Cue sheets with several BINARY
+    files, MODE1/2352, MODE2/2352 and AUDIO tracks, INDEX 01 and PREGAP;
+    sector lookup, track table, region from the licence text of sector 4.
+    The core still opens no files: the harness and the frontend read them
+    and hand over bytes.
+  - `psx-core/src/cdrom.rs`: the controller. Banked registers, parameter
+    and result FIFOs, interrupts INT1-INT5 queued until the previous one is
+    acknowledged, IRQ2; commands Nop, Setloc, Play, ReadN/ReadS, MotorOn,
+    Stop, Pause, Init, Mute/Demute, Setfilter, Setmode, Getparam, GetlocL,
+    GetlocP, SetSession, GetTN, GetTD, SeekL/SeekP, Test 20h, GetID,
+    ReadTOC; response times from psx-spx "CDROM - Response Timings";
+    sectors at 75 or 150 per second, 800h or 924h bytes.
+  - Bus: registers at 1F801800h-1F801803h, DMA channel 3.
+  - `--disc <cue|bin>` in the harness and the frontend.
+  - 268 unit tests (252 core, 11 harness, 5 frontend).
+- Results (Sony BIOS SCPH-1001):
+  - No disc: main menu after about 800 million cycles; scripted pad
+    presses open the memory card manager and the CD player.
+  - Symphony of the Night (NTSC-U): PlayStation logo with the SCEA licence
+    text, `SYSTEM.CNF` read, `SLUS_000.67` loaded and started. The game
+    then prints "MDEC_out_sync timeout" repeatedly: its first screen is a
+    video and there is no MDEC. START does not skip it.
+- Broke / surprised us:
+  - **A commit with tests that did not compile was pushed** (4ae2f64). I
+    added the `disc` field to the frontend's `Options` and ran test,
+    clippy, commit and push in one shell line joined with `;` instead of
+    `&&`, so the failing test build did not stop the commit. The next
+    commit (99c5a7c) fixes the test; history was not rewritten. Rule 3
+    says this must not happen: checks and commit are now always chained
+    with `&&`.
+  - The disc module was committed (aedda25) before `pub mod disc;` was in
+    `lib.rs`, so that commit builds but does not compile the file. The
+    next commit adds it.
+  - One of my controller tests read a single byte of a sector and expected
+    the next request to deliver the following sector. The controller keeps
+    the current buffer until software clears the request bit, which real
+    programs do; the test helper now does the same. The test was wrong,
+    not the code.
+  - The data-request test for "missing device" DMA and the "unhandled I/O"
+    test used the CD-ROM as their missing device; they now use MDEC-in and
+    SIO1.
+- Deviations from hardware, all commented in the code: seek time is a
+  fixed 4 sectors (psx-spx: "seek timings are still unknown"); the delay
+  between acknowledging one interrupt and seeing the next is a guess
+  (2000 cycles); XA-ADPCM sectors are dropped and Play only moves the
+  head, no sound; DMA3 always costs 24 cycles per word; the controller
+  version is reported as vC1 (a) without knowing what an SCPH-1001 has
+  (the BIOS prints "System Controller ROM Version 95/05/16 c1" from it);
+  16- and 32-bit reads of the registers return one register.
+- Not verified: Play/report/auto-pause against a real program (unit tests
+  only); the memory card manager's copy and delete; multi-track games.
+- Human stepped in for: nothing.
+- Next: MDEC (Phase 7), because the only game available cannot get past
+  its first video without it; then the SPU. A 3D game image from the
+  owner is needed for the Phase 6 "3D game is playable" criterion.
+
 ## 2026-11-11 — Sony BIOS: timing fixes
 
 Model: claude-fable-5-2 · Session time: ~1h (estimate, not measured) · Human interventions: 2

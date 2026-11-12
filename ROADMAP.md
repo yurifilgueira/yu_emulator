@@ -100,11 +100,26 @@ them pass and are recorded in `DEVLOG.md`.
     functions. The memory card is only covered by unit tests written from
     psx-spx; no program has read or written one.
 
-## Phase 6 — CD-ROM
+## Phase 6 — CD-ROM ✅ drive works; the first game stops at its intro video (needs MDEC, Phase 7)
 
-- [ ] `.bin/.cue` loading, command state machine, response timing
+- [x] `.bin/.cue` loading, command state machine, response timing
 - **Accept:** PlayStation logo boot sequence; first commercial 3D game is
   playable.
+  Status on 2026-11-12, Sony BIOS SCPH-1001:
+  - Logo boot sequence: done. With a licensed disc the BIOS shows the
+    PlayStation logo with "Licensed by Sony Computer Entertainment America",
+    reads `SYSTEM.CNF` and starts the game's executable.
+  - Without a disc the BIOS reaches its main menu; the pad moves through
+    it and opens the memory card manager and the CD player (the Phase 3 and
+    Phase 5 items that were waiting for the drive). Copying or deleting
+    saves in the manager has not been tried: there is no card with saves.
+  - First game: **not playable yet.** The only disc image available,
+    Castlevania: Symphony of the Night (NTSC-U), boots and then prints
+    "MDEC_out_sync timeout" for ever: it starts with a video and the video
+    decoder is Phase 7. It is also a 2D game; the 3D half of the criterion
+    needs another disc from the owner.
+  - Not emulated: XA-ADPCM and CD audio output (waits for the SPU), seek
+    times, the drive door, most test commands.
 
 ## Phase 7 — SPU and MDEC
 

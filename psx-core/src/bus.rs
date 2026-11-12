@@ -16,6 +16,7 @@
 //! errors. Until the individual devices exist (Phase 2+) the whole I/O window
 //! 0x1F80_1000-0x1F80_2FFF and expansion 2 are treated as mapped stubs.
 
+use crate::cdrom::Cdrom;
 use crate::dma::{self, Dma, SyncMode};
 use crate::gpu::Gpu;
 use crate::irq::{Interrupt, Irq};
@@ -140,6 +141,7 @@ pub struct Bus {
     pub spu: Spu,
     /// Controller and memory card port.
     pub sio0: Sio0,
+    pub cdrom: Cdrom,
     /// Distinct unhandled accesses, in first-seen order.
     unhandled: Vec<UnhandledAccess>,
     unhandled_seen: HashSet<UnhandledAccess>,
@@ -170,6 +172,7 @@ impl Bus {
             stall: 0,
             spu: Spu::default(),
             sio0: Sio0::default(),
+            cdrom: Cdrom::default(),
             unhandled: Vec::new(),
             unhandled_seen: HashSet::new(),
         })
@@ -198,6 +201,7 @@ impl Bus {
             self.irq.request(Interrupt::Vblank);
         }
         self.sio0.tick(cycles, &mut self.irq);
+        self.cdrom.tick(cycles, &mut self.irq);
         // A linked-list transfer in progress takes the bus for a slice of
         // nodes after every instruction (see `LIST_NODES_PER_SLICE`).
         let mut nodes = 0;
@@ -399,6 +403,11 @@ impl Bus {
             let value = self.sio0.read(off, width.bytes());
             return value & (0xFFFF_FFFF >> (32 - 8 * width.bytes() as u32));
         }
+        // psx-spx: "CDROM Controller I/O Ports" — four byte-wide registers.
+        // Deviation: a 16- or 32-bit read returns only the addressed one.
+        if (0x1F80_1800..0x1F80_1804).contains(&addr) {
+            return self.cdrom.read(addr & 3) as u32;
+        }
         let reg = addr & !3;
         let value = match reg {
             0x1F80_1000..=0x1F80_1020 => self.mem_ctrl[((reg - 0x1F80_1000) / 4) as usize],
@@ -444,6 +453,12 @@ impl Bus {
             if width == Width::Word && off == 0x8 {
                 self.sio0.write(0xA, val >> 16);
             }
+            return;
+        }
+        if (0x1F80_1800..0x1F80_1804).contains(&addr) {
+            self.cdrom.write(addr & 3, val as u8, &mut self.irq);
+            // Requesting the sector buffer raises the DMA3 data request.
+            self.dma_start_ready_channels();
             return;
         }
         let reg = addr & !3;
@@ -519,9 +534,11 @@ impl Bus {
             // The GPU executes commands instantly, so it is always ready
             // for data (deviation: GP1(04h) "DMA Direction" is not checked).
             // The SPU requests data while a DMA transfer mode is selected.
+            // The CD-ROM requests while its sector buffer has bytes.
             // No other device exists yet.
             let dreq = match n {
                 dma::CHANNEL_GPU => true,
+                dma::CHANNEL_CDROM => self.cdrom.data_ready(),
                 dma::CHANNEL_SPU => self.spu.dma_request(),
                 _ => false,
             };
@@ -537,6 +554,7 @@ impl Bus {
                     }
                 }
                 (dma::CHANNEL_GPU | dma::CHANNEL_SPU, SyncMode::Burst | SyncMode::Slice) => self.dma_block(n),
+                (dma::CHANNEL_CDROM, SyncMode::Burst) => self.dma_block(n),
                 // Device not implemented (or reserved sync mode): the
                 // transfer stays pending, as if DREQ never came.
                 _ => self.record(Region::Io, AccessKind::Store, Width::Word, 0x1F80_1088 + 0x10 * n as u32),
@@ -610,12 +628,19 @@ impl Bus {
             if channel.chcr & dma::CHCR_FROM_RAM != 0 {
                 match (self.dma_read(addr), n) {
                     (Some(word), dma::CHANNEL_GPU) => self.gp0(word),
-                    (Some(word), _) => self.spu.dma_write(word),
+                    (Some(word), dma::CHANNEL_SPU) => self.spu.dma_write(word),
+                    // The CD-ROM channel only transfers to RAM.
+                    (Some(_), _) => {}
                     (None, _) => in_ram = false,
                 }
             } else {
                 // "DMA2 is equivalent to accessing Port 1F801810h".
-                let word = if n == dma::CHANNEL_GPU { self.gpu.read() } else { self.spu.dma_read() };
+                let word = match n {
+                    dma::CHANNEL_GPU => self.gpu.read(),
+                    dma::CHANNEL_SPU => self.spu.dma_read(),
+                    // DMA3 reads the sector buffer, as RDDATA does.
+                    _ => u32::from_le_bytes(std::array::from_fn(|_| self.cdrom.read_data())),
+                };
                 in_ram &= self.dma_write(addr, word);
             }
             addr = addr.wrapping_add(channel.step()) & 0x00FF_FFFC;
@@ -626,8 +651,16 @@ impl Bus {
             self.dma.channels[n].madr = addr;
             self.dma.channels[n].bcr &= 0xFFFF;
         }
-        // psx-spx: "DMA Transfer Rates" — GPU 1 clk/word, SPU 4 clks/word.
-        self.stall += words * if n == dma::CHANNEL_SPU { 4 } else { 1 };
+        // psx-spx: "DMA Transfer Rates" — GPU 1 clk/word, SPU 4 clks/word,
+        // CDROM 24 clks/word with the BIOS's setting (40 with the one most
+        // games use; the Memory Control register that selects it is not
+        // modelled, so 24 is used for all).
+        self.stall += words
+            * match n {
+                dma::CHANNEL_SPU => 4,
+                dma::CHANNEL_CDROM => 24,
+                _ => 1,
+            };
         if !in_ram {
             self.dma.bus_error(&mut self.irq);
         }
@@ -799,12 +832,12 @@ mod tests {
     #[test]
     fn io_accesses_are_recorded_once() {
         let mut b = bus();
-        // Devices that are still stubs: CD-ROM and SPU voices.
-        b.store32(0x1F80_1800, 0xB88).unwrap();
-        b.store32(0x1F80_1800, 0xB88).unwrap();
+        // Devices that are still missing or stubs: SIO1 and SPU voices.
+        b.store32(0x1F80_1050, 0xB88).unwrap();
+        b.store32(0x1F80_1050, 0xB88).unwrap();
         b.load16(0x1F80_1C00).unwrap(); // SPU
         assert_eq!(b.unhandled().len(), 2);
-        assert_eq!(b.unhandled()[0].addr, 0x1F80_1800);
+        assert_eq!(b.unhandled()[0].addr, 0x1F80_1050);
         assert_eq!(b.unhandled()[0].kind, AccessKind::Store);
         assert_eq!(b.unhandled()[1].addr, 0x1F80_1C00);
     }
@@ -1049,10 +1082,57 @@ mod tests {
     #[test]
     fn dma_to_missing_device_stays_pending_and_is_reported() {
         let mut b = bus();
-        b.store32(DPCR, 0x0765_C321).unwrap(); // enable channel 3 (CD-ROM)
+        b.store32(DPCR, 0x0765_4329).unwrap(); // enable channel 0 (MDEC in)
+        b.store32(0x1F80_1088, 0x1100_0000).unwrap();
+        assert_eq!(b.load32(0x1F80_1088).unwrap(), 0x1100_0000);
+        assert!(b.unhandled().iter().any(|a| a.addr == 0x1F80_1088));
+    }
+
+    #[test]
+    fn dma3_copies_a_cd_sector_to_ram() {
+        // psx-spx: "DMA Channels" — DMA3 CDROM, CHCR 11000000h, BCR = words;
+        // "CDROM Controller I/O Ports" — the sector is requested with BFRD.
+        use crate::disc::{tests::data_track, Disc};
+        let mut b = bus();
+        b.cdrom.insert(Some(Disc::from_data_track(data_track(40)).unwrap()));
+        let command = |b: &mut Bus, command: u8, parameters: &[u8]| {
+            b.store8(0x1F80_1800, 0).unwrap();
+            for p in parameters {
+                b.store8(0x1F80_1802, *p).unwrap();
+            }
+            b.store8(0x1F80_1801, command).unwrap();
+            b.store8(0x1F80_1800, 1).unwrap();
+            while b.load8(0x1F80_1803).unwrap() & 7 == 0 {
+                b.tick(1000);
+            }
+            b.store8(0x1F80_1803, 0x07).unwrap();
+        };
+        b.store8(0x1F80_1800, 1).unwrap();
+        b.store8(0x1F80_1802, 0x1F).unwrap();
+        command(&mut b, 0x0E, &[0x80]); // Setmode: double speed, 800h bytes
+        command(&mut b, 0x02, &[0x00, 0x02, 0x33]); // Setloc 00:02:33 = sector 33
+        command(&mut b, 0x06, &[]); // ReadN
+        assert_eq!(b.irq.stat() & 4, 4, "IRQ2 was requested");
+        // Wait for INT1.
+        b.store8(0x1F80_1800, 1).unwrap();
+        while b.load8(0x1F80_1803).unwrap() & 7 != 1 {
+            b.tick(1000);
+        }
+        b.store8(0x1F80_1800, 0).unwrap();
+        b.store8(0x1F80_1803, 0x80).unwrap();
+        assert_eq!(b.load8(0x1F80_1800).unwrap() & 0x40, 0x40, "DRQSTS");
+
+        b.store32(DPCR, 0x0765_C321).unwrap();
+        b.store32(0x1F80_10B0, 0x0001_0000).unwrap();
+        b.store32(0x1F80_10B4, 0x200).unwrap();
+        b.take_stall();
         b.store32(0x1F80_10B8, 0x1100_0000).unwrap();
-        assert_eq!(b.load32(0x1F80_10B8).unwrap(), 0x1100_0000);
-        assert!(b.unhandled().iter().any(|a| a.addr == 0x1F80_10B8));
+        assert_eq!(b.load32(0x8001_0000).unwrap(), 0x2121_2121);
+        assert_eq!(b.load32(0x8001_07FC).unwrap(), 0x2121_2121);
+        assert_eq!(b.load32(0x8001_0800).unwrap(), 0, "only 200h words");
+        assert_eq!(b.load32(0x1F80_10B8).unwrap() & 0x0100_0000, 0, "finished");
+        assert_eq!(b.take_stall(), 0x200 * 24, "24 clks/word");
+        assert_eq!(b.load8(0x1F80_1800).unwrap() & 0x40, 0, "buffer empty");
     }
 
     // ---- stubs for later phases ------------------------------------------

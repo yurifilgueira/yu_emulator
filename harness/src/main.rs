@@ -15,6 +15,7 @@ mod input;
 
 use image::Rgb;
 use psx_core::disasm::disassemble;
+use psx_core::disc::Disc;
 use psx_core::exe::Exe;
 use psx_core::sio::{DigitalPad, MemoryCard};
 use psx_core::{map, Bus, Psx};
@@ -61,7 +62,9 @@ fn usage() -> ExitCode {
          --press BUTTON[+BUTTON]@FRAME[+LENGTH]  hold buttons from a video frame of the run\n      \
          (repeatable; buttons: select start up right down left l1 l2 r1 r2 triangle circle cross square)\n  \
          --card <file>  memory card in slot 1: a raw 128 KB image, created formatted if\n      \
-         missing and written back if the program changed it"
+         missing and written back if the program changed it\n  \
+         --disc <file>  disc in the drive: a .cue sheet (its .bin files next to it) or a\n      \
+         single .bin with one data track"
     );
     ExitCode::from(2)
 }
@@ -138,6 +141,8 @@ struct RunOptions {
     script: input::Script,
     /// --card: memory card image for slot 1.
     card: Option<String>,
+    /// --disc: disc image for the CD-ROM drive.
+    disc: Option<String>,
 }
 
 impl RunOptions {
@@ -154,6 +159,7 @@ impl RunOptions {
             region: None,
             script: input::Script::default(),
             card: None,
+            disc: None,
         };
         let mut args = args.iter();
         while let Some(arg) = args.next() {
@@ -175,6 +181,7 @@ impl RunOptions {
                 "--frame-out" => options.frame_out = Some(args.next()?.clone()),
                 "--diff-out" => options.diff_out = Some(args.next()?.clone()),
                 "--card" => options.card = Some(args.next()?.clone()),
+                "--disc" => options.disc = Some(args.next()?.clone()),
                 "--press" => {
                     if let Err(e) = options.script.add(args.next()?) {
                         eprintln!("{e}");
@@ -195,14 +202,17 @@ impl RunOptions {
     /// Only --cycles was given.
     fn is_plain(&self) -> bool {
         let paths = [&self.expect, &self.vram_out, &self.frame_out, &self.diff_out];
-        let no_devices = self.card.is_none() && self.script == input::Script::default();
+        let no_devices = self.card.is_none() && self.disc.is_none() && self.script == input::Script::default();
         !self.trace && self.region.is_none() && no_devices && paths.iter().all(|o| o.is_none())
     }
 
-    /// Plugs in the devices: a digital pad in port 1 and, with --card, a
-    /// memory card in slot 1.
+    /// Plugs in the devices: a digital pad in port 1, with --card a memory
+    /// card in slot 1 and with --disc a disc in the drive.
     fn plug_devices(&self, psx: &mut Psx) -> Result<(), String> {
         psx.bus.sio0.ports[0].pad = Some(DigitalPad::default());
+        if let Some(path) = &self.disc {
+            psx.bus.cdrom.insert(Some(load_disc(path)?));
+        }
         let Some(path) = &self.card else { return Ok(()) };
         let card = match std::fs::read(path) {
             Ok(data) => MemoryCard::new(data).ok_or_else(|| format!("{path}: a memory card image must be 131072 bytes"))?,
@@ -231,6 +241,20 @@ impl RunOptions {
             Rgb::from_frame(psx.bus.gpu.frame()).write_png(Path::new(path))?;
         }
         Ok(())
+    }
+}
+
+/// Reads a disc image: a .cue sheet and the .bin files it names (looked up
+/// next to the sheet), or a single .bin holding one data track.
+fn load_disc(path: &str) -> Result<Disc, String> {
+    let path = Path::new(path);
+    let read = |file: &Path| std::fs::read(file).map_err(|e| format!("could not read {}: {e}", file.display()));
+    if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("cue")) {
+        let cue = String::from_utf8_lossy(&read(path)?).into_owned();
+        let dir = path.parent().unwrap_or(Path::new("."));
+        Disc::from_cue(&cue, |name| read(&dir.join(name))).map_err(|e| format!("{}: {e}", path.display()))
+    } else {
+        Disc::from_data_track(read(path)?).map_err(|e| format!("{}: {e}", path.display()))
     }
 }
 
