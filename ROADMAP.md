@@ -124,15 +124,27 @@ them pass and are recorded in `DEVLOG.md`.
   - Not emulated: XA-ADPCM and CD audio output (waits for the SPU), seek
     times, the drive door, most test commands.
 
-## Phase 7 — SPU and MDEC (MDEC done, SPU not started)
+## Phase 7 — SPU and MDEC ✅ (sound checked by measurement, not yet by ear)
 
 - [x] MDEC: commands, run-length decoding, IDCT, colour conversion, DMA0/DMA1
-- [ ] SPU: voices, ADPCM, envelopes, reverb, CD audio and XA-ADPCM input
-- [ ] Audio output in the frontend
+- [x] SPU: voices, ADPCM, envelopes, noise, volumes and sweeps, reverb,
+      capture buffers, interrupt
+- [x] CD sound: XA-ADPCM and CD-DA into the SPU, CD volume registers
+- [x] Sound output in the frontend; `--audio-out` (WAV) in the harness
 - **Accept:** BIOS boot sound; music and FMVs in the first game.
-  Status on 2026-11-12: the opening video of Symphony of the Night plays
-  (checked by looking at single frames, not against a reference decoder).
-  No sound of any kind yet.
+  Status on 2026-11-12, Sony BIOS SCPH-1001:
+  - FMVs: the opening video of Symphony of the Night plays (frames looked
+    at one by one, not compared with a reference decoder).
+  - BIOS boot sound: the SPU produces sound for about 7 seconds during
+    the logo, peaking at 29279 of 32767 with reverb. **Nobody has listened
+    to it yet**: the check is on the WAV file's levels, not on what it
+    sounds like.
+  - Music in the game: the WAV of a run through the opening video and the
+    title screen has continuous sound (XA-ADPCM during the video, SPU
+    voices at the menu); in the loudest second 0.2% of the samples
+    saturate. Same caveat: measured, not heard.
+  - Needs the owner's ears: run the frontend and say whether the BIOS
+    chime and the game's music sound right.
 
 ## Phase 8 — Compatibility and performance
 
