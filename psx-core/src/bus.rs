@@ -205,6 +205,8 @@ impl Bus {
         }
         self.sio0.tick(cycles, &mut self.irq);
         self.cdrom.tick(cycles, &mut self.irq);
+        // CD audio is not connected yet: the SPU hears silence from it.
+        self.spu.tick(cycles, &mut self.irq, || [0, 0]);
         // A linked-list transfer in progress takes the bus for a slice of
         // nodes after every instruction (see `LIST_NODES_PER_SLICE`).
         let mut nodes = 0;
@@ -861,14 +863,14 @@ mod tests {
     #[test]
     fn io_accesses_are_recorded_once() {
         let mut b = bus();
-        // Devices that are still missing or stubs: SIO1 and SPU voices.
+        // Devices that are still missing: SIO1 and the SPU's reverb.
         b.store32(0x1F80_1050, 0xB88).unwrap();
         b.store32(0x1F80_1050, 0xB88).unwrap();
-        b.load16(0x1F80_1C00).unwrap(); // SPU
+        b.load16(0x1F80_1DC0).unwrap(); // SPU reverb
         assert_eq!(b.unhandled().len(), 2);
         assert_eq!(b.unhandled()[0].addr, 0x1F80_1050);
         assert_eq!(b.unhandled()[0].kind, AccessKind::Store);
-        assert_eq!(b.unhandled()[1].addr, 0x1F80_1C00);
+        assert_eq!(b.unhandled()[1].addr, 0x1F80_1DC0);
     }
 
     #[test]
@@ -1209,9 +1211,13 @@ mod tests {
     #[test]
     fn spu_registers_are_reachable_and_unimplemented_ones_reported() {
         let mut b = bus();
-        b.store16(0x1F80_1C00, 0x1234).unwrap(); // voice 0 volume: no voices yet
+        b.store16(0x1F80_1DC0, 0x1234).unwrap(); // reverb: not emulated
+        assert_eq!(b.load16(0x1F80_1DC0).unwrap(), 0x1234);
+        assert!(b.unhandled().iter().any(|a| a.addr == 0x1F80_1DC0));
+        // Voice registers are implemented.
+        b.store16(0x1F80_1C00, 0x1234).unwrap();
         assert_eq!(b.load16(0x1F80_1C00).unwrap(), 0x1234);
-        assert!(b.unhandled().iter().any(|a| a.addr == 0x1F80_1C00));
+        assert!(!b.unhandled().iter().any(|a| a.addr == 0x1F80_1C00));
         // The transfer registers are implemented and not reported.
         b.store(0x1F80_1DAA, Width::Byte, 0x1234_5625).unwrap();
         assert_eq!(b.load16(0x1F80_1DAA).unwrap(), 0x5625);
