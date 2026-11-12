@@ -205,8 +205,10 @@ impl Bus {
         }
         self.sio0.tick(cycles, &mut self.irq);
         self.cdrom.tick(cycles, &mut self.irq);
-        // CD audio is not connected yet: the SPU hears silence from it.
-        self.spu.tick(cycles, &mut self.irq, || [0, 0]);
+        // psx-spx: "Additional Sound Inputs" — the CD-ROM drive passes
+        // CD-DA and XA-ADPCM sound to the SPU.
+        let cdrom = &mut self.cdrom;
+        self.spu.tick(cycles, &mut self.irq, || cdrom.audio_sample());
         // A linked-list transfer in progress takes the bus for a slice of
         // nodes after every instruction (see `LIST_NODES_PER_SLICE`).
         let mut nodes = 0;
