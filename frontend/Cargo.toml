@@ -10,5 +10,6 @@ name = "yu-emulator"
 path = "src/main.rs"
 
 [dependencies]
+cpal = "0.15"
 minifb = "0.29.0"
 psx-core = { path = "../psx-core" }

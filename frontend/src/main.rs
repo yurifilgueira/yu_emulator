@@ -8,6 +8,8 @@
 //! card in slot 1. There is no speed regulation beyond the window's 60 Hz
 //! refresh: one emulated frame per window update.
 
+mod audio;
+
 use minifb::{Key, KeyRepeat, Window, WindowOptions};
 use psx_core::disc::Disc;
 use psx_core::exe::Exe;
@@ -27,7 +29,7 @@ const MAX_CYCLES_PER_UPDATE: u64 = 1_000_000;
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: yu-emulator <bios.bin> [program.exe] [--disc FILE] [--vram] [--card FILE] [--frames N]\n\n  \
+        "usage: yu-emulator <bios.bin> [program.exe] [--disc FILE] [--vram] [--card FILE] [--frames N] [--mute]\n\n  \
          <bios.bin>     PlayStation BIOS image (512 KB)\n  \
          [program.exe]  PS-EXE to run instead of the BIOS shell\n  \
          --disc FILE    disc in the drive: a .cue sheet (its .bin files next to it) or\n                 \
@@ -35,7 +37,8 @@ fn usage() -> ExitCode {
          --vram         start with the whole 1024x512 VRAM instead of the display\n  \
          --card FILE    memory card in slot 1: a raw 128 KB image, created formatted if\n                 \
          missing and written back on exit if it changed\n  \
-         --frames N     quit after N window updates (for automated checks)\n\n\
+         --frames N     quit after N window updates (for automated checks)\n  \
+         --mute         no sound\n\n\
          keys: Tab switches between display and VRAM, Esc quits\n\
          pad:  arrows = d-pad, Enter = START, Backspace = SELECT,\n      \
          Z = cross, X = circle, A = square, S = triangle, Q/W = L1/R1, 1/2 = L2/R2"
@@ -50,16 +53,18 @@ struct Options {
     frames: Option<u64>,
     card: Option<String>,
     disc: Option<String>,
+    mute: bool,
 }
 
 impl Options {
     fn parse(args: &[String]) -> Option<Self> {
         let mut positional = Vec::new();
-        let mut options = Self { bios: String::new(), exe: None, show_vram: false, frames: None, card: None, disc: None };
+        let mut options = Self { bios: String::new(), exe: None, show_vram: false, frames: None, card: None, disc: None, mute: false };
         let mut args = args.iter();
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--vram" => options.show_vram = true,
+                "--mute" => options.mute = true,
                 "--frames" => options.frames = Some(args.next()?.parse().ok()?),
                 "--card" => options.card = Some(args.next()?.clone()),
                 "--disc" => options.disc = Some(args.next()?.clone()),
@@ -220,6 +225,13 @@ fn main() -> ExitCode {
     };
     window.set_target_fps(60);
 
+    // Sound is optional: without a device the emulator runs silently.
+    let sound = if options.mute {
+        None
+    } else {
+        audio::Output::open(psx_core::spu::SAMPLE_RATE).map_err(|e| eprintln!("no sound: {e}")).ok()
+    };
+
     let mut show_vram = options.show_vram;
     let mut updates = 0u64;
     let stdout = std::io::stdout();
@@ -231,6 +243,10 @@ fn main() -> ExitCode {
             pad.pressed = pad_buttons(|key| window.is_key_down(key));
         }
         run_frame(&mut psx, &mut stdout.lock());
+        let samples = psx.bus.spu.take_samples();
+        if let Some(sound) = &sound {
+            sound.push(&samples);
+        }
         let picture = if show_vram { vram_picture(&psx) } else { display_picture(&psx) };
         if let Err(e) = window.update_with_buffer(&picture.pixels, picture.width, picture.height) {
             eprintln!("could not update the window: {e}");
@@ -289,6 +305,7 @@ mod tests {
             frames: None,
             card: Some(path.display().to_string()),
             disc: None,
+            mute: true,
         };
         let mut psx = boot(&options).unwrap();
         assert!(psx.bus.sio0.ports[0].pad.is_some());
