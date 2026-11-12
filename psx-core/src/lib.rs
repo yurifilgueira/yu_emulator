@@ -15,6 +15,7 @@ pub mod gpu;
 pub mod gte;
 pub mod irq;
 pub mod map;
+pub mod mdec;
 pub mod sio;
 pub mod spu;
 pub mod system;

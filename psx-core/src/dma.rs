@@ -5,6 +5,8 @@
 
 use crate::irq::{Interrupt, Irq};
 
+pub const CHANNEL_MDEC_IN: usize = 0;
+pub const CHANNEL_MDEC_OUT: usize = 1;
 pub const CHANNEL_GPU: usize = 2;
 pub const CHANNEL_CDROM: usize = 3;
 pub const CHANNEL_SPU: usize = 4;

@@ -17,6 +17,48 @@ Model: claude-fable-5-2 · Session time: Xh · Human interventions: N
 
 ---
 
+## 2026-11-12 — Phase 7 (first part): MDEC
+
+Model: claude-fable-5-2 · Session time: ~1h (estimate, not measured) · Human interventions: 0
+
+- Why now: Symphony of the Night, the only game available, opens with a
+  video and could not get past it (see the Phase 6 entry below).
+- Done (branch `phase-7-mdec`, on top of `phase-6-cdrom`, pull request):
+  - `psx-core/src/mdec.rs`: commands 1 (decode), 2 (quant tables) and 3
+    (scale table), status and control registers, run-length decoding fed
+    one halfword at a time, the IDCT psx-spx calls "real_idct_core", YUV
+    to RGB at 15 and 24 bits, 4- and 8-bit monochrome.
+  - Bus: registers at 1F801820h/1F801824h, DMA0 (in) and DMA1 (out). A
+    DMA1 transfer waits until the data it asks for has been decoded.
+  - 282 unit tests (266 core, 11 harness, 5 frontend).
+- Results (Sony BIOS SCPH-1001, Symphony of the Night, harness with
+  scripted presses, pictures looked at by me):
+  - 900 M cycles: a frame of the opening video, colours plausible.
+  - 1500 M: title screen, "PRESS START BUTTON".
+  - START, START, cross, cross: file menu, "Checking Memory Card", name
+    entry. Cross, START, cross, cross: "Journey back to 1792", "Final
+    Stage: Bloodlines", then the first stage with the character, the HUD
+    and, after another START, the pause banner (3100 M cycles).
+  - No "timeout" message in any of these runs.
+- Broke / surprised us:
+  - My bus test for the MDEC sent DC 100 in all six blocks and expected
+    grey; the colour blocks were not zero, so the picture was rightly
+    tinted. The decoder was correct; the test data was wrong. Found by
+    printing the output words (the print was removed before the commit).
+- Deviations, commented in the code: decoding is instantaneous; the
+  output queue holds macroblocks already in picture order, so DMA1 does no
+  reordering and manual reads of the data register differ from hardware;
+  no FIFO limits; fixed-point precision of the colour conversion is my
+  choice (psx-spx: "unknown"); the IDCT is the documented approximation.
+- Not verified: pixel accuracy against a console or another decoder;
+  24-bit and monochrome output with a real program; the game beyond its
+  first seconds; speed (the harness ran at roughly half of real time on
+  the notebook, three runs in parallel).
+- Human stepped in for: nothing. The owner asked during the work whether
+  the game could be tested yet; at that moment the MDEC was not wired in.
+- Next: the SPU (voices, ADPCM, envelopes), then XA and CD audio, then
+  sound output in the frontend.
+
 ## 2026-11-12 — Phase 6: CD-ROM
 
 Model: claude-fable-5-2 · Session time: ~2h (estimate, not measured; the session was cut once by a usage limit) · Human interventions: 0

@@ -18,7 +18,8 @@ mistakes) and the roadmap with acceptance criteria for each phase.
 | GTE              | ✅ all commands, flags, inexact division | unit tests, ps1-tests `gte/test-all` (1150/1150) |
 | Controllers / memory cards | ✅ digital pad; memory card untested by any program | unit tests, ps1-tests `input/pad`, programs driven through their menus |
 | CD-ROM           | ✅ data discs boot; no CD audio or XA sound yet | unit tests, Sony BIOS logo and menu, a game booting from its disc image |
-| SPU / MDEC       | ⏳ (SPU: only sound RAM transfers) | — |
+| MDEC             | ✅ decoding takes no time | unit tests, a game's opening video |
+| SPU              | ⏳ only sound RAM transfers, no sound | — |
 
 Game Boy support is planned after the PS1 (see `ROADMAP.md`).
 
@@ -49,7 +50,7 @@ cargo run --release -p psx-harness -- suite bios/your-bios.bin tests/ps1-tests
 cargo run --release -p frontend -- bios/your-bios.bin [program.exe]
 ```
 
-`cargo test` runs 268 unit tests and needs no BIOS. The test programs are not
+`cargo test` runs 282 unit tests and needs no BIOS. The test programs are not
 in the repository: unpack the [ps1-tests](https://github.com/JaCzekanski/ps1-tests/releases)
 release into `tests/ps1-tests/` and amidog's CPU tests into `tests/amidog/`
 (both gitignored). Currently 16 of the 32 ps1-tests programs that have a
