@@ -434,6 +434,14 @@ fn cmd_run(bios: &str, exe: Option<&String>, options: RunOptions) -> ExitCode {
         let line: Vec<String> = (row * 4..row * 4 + 4).map(|r| format!("{:>4} {:08X}", NAMES[r], psx.cpu.reg(r))).collect();
         eprintln!("{}", line.join("  "));
     }
+    eprintln!(
+        "i_stat 0x{:04X}   i_mask 0x{:04X}   display lines {:?}   scanline {}   frame {}",
+        psx.bus.irq.stat(),
+        psx.bus.irq.mask(),
+        psx.bus.gpu.video.vertical_range(),
+        psx.bus.gpu.video.line(),
+        psx.bus.gpu.video.frame()
+    );
     let (width, height) = psx.bus.gpu.display_size();
     eprintln!(
         "GPU: {} GP0 words, display {width}x{height}, VRAM hash {:016x}",
