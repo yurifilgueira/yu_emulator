@@ -100,6 +100,25 @@ impl fmt::Display for BiosError {
 
 impl std::error::Error for BiosError {}
 
+/// Linked-list nodes transferred between two CPU instructions.
+///
+/// psx-spx: "CPU Operation during DMA" — during DMA the CPU runs only while
+/// it touches nothing but cache, scratchpad and coprocessors; "any read
+/// access from RAM or I/O registers ... will stall the CPU until the DMA is
+/// finished", and it "resumes during periods when DMA gets interrupted
+/// (ie. ... after SyncMode 2 list entries)". Ordinary code reads RAM all
+/// the time, so in practice it stands still while a list goes out. That is
+/// not modelled access by access; instead the list advances many nodes per
+/// instruction, which keeps the CPU from racing a list it has just started.
+/// The Sony BIOS shell depends on this: it reuses primitive memory for the
+/// next frame right after sending a list, and with one node per instruction
+/// (the Phase 2 model) the CPU overtook the list and rewrote packets under
+/// it, sending it off to address 0. The CPU still gets one instruction per
+/// slice, so an endless list (ps1-tests dma/chain-looping) cannot hang it.
+/// Deviation: on hardware that test measures the CPU running at about 60%
+/// of its speed, far more than one instruction per 64 nodes.
+const LIST_NODES_PER_SLICE: u32 = 64;
+
 pub struct Bus {
     ram: Box<[u8]>,
     bios: Box<[u8]>,
@@ -179,14 +198,19 @@ impl Bus {
             self.irq.request(Interrupt::Vblank);
         }
         self.sio0.tick(cycles, &mut self.irq);
-        if self.dma_list_active {
+        // A linked-list transfer in progress takes the bus for a slice of
+        // nodes after every instruction (see `LIST_NODES_PER_SLICE`).
+        let mut nodes = 0;
+        while self.dma_list_active && nodes < LIST_NODES_PER_SLICE {
             self.dma_list_node();
+            nodes += 1;
         }
     }
 
-    /// Cycles during which DMA held the bus since the last call. The CPU is
-    /// stopped for that long (psx-spx: "CPU Operation during DMA"), so the
-    /// caller advances the clock without executing instructions.
+    /// Cycles since the last call during which the CPU was waiting: for DMA
+    /// holding the bus (psx-spx: "CPU Operation during DMA") or for its own
+    /// memory reads (`read_delay`). The caller advances the clock by that
+    /// much without executing instructions.
     pub fn take_stall(&mut self) -> u32 {
         std::mem::take(&mut self.stall)
     }
@@ -219,6 +243,53 @@ impl Bus {
     pub fn store32(&mut self, addr: u32, val: u32) -> Result<(), BusFault> {
         debug_assert!(addr.is_multiple_of(4), "unaligned store32 @ 0x{addr:08X}");
         self.store(addr, Width::Word, val)
+    }
+
+    /// Cycles a CPU read at `vaddr` takes beyond the instruction's own one.
+    ///
+    /// psx-spx "Memory Control" explains that every region has its own
+    /// access time, set by the delay/size registers, with a formula it
+    /// calls "fairly complex overall, and difficult to properly describe".
+    /// Instead of that formula, these are the times measured on a console
+    /// by ps1-tests cpu/access-time (its psx.log, rounded, minus the one
+    /// cycle of the instruction), which are the values for the settings
+    /// the BIOS programs. Software that reprograms the delays is not
+    /// followed. Writes go through the write queue and cost nothing extra
+    /// (psx-spx: "Store operations are passed to the write-queue, so they
+    /// can execute within a single clock cycle").
+    pub fn read_delay(vaddr: u32, width: Width) -> u32 {
+        let addr = mask_region(vaddr);
+        let by_width = |byte: u32, half: u32, word: u32| match width {
+            Width::Byte => byte,
+            Width::Half => half,
+            Width::Word => word,
+        };
+        if map::RAM.contains(addr).is_some() {
+            4
+        } else if map::BIOS.contains(addr).is_some() {
+            by_width(7, 12, 24)
+        } else if map::SCRATCHPAD.contains(addr).is_some() || map::CACHE_CONTROL.contains(addr).is_some() {
+            0
+        } else if map::EXPANSION_1.contains(addr).is_some() {
+            by_width(6, 13, 25)
+        } else if map::EXPANSION_3.contains(addr).is_some() {
+            by_width(6, 5, 9)
+        } else if map::EXPANSION_2.contains(addr).is_some() {
+            by_width(10, 25, 55)
+        } else if map::SPU.contains(addr).is_some() {
+            by_width(17, 17, 38)
+        } else if (0x1F80_1800..0x1F80_1804).contains(&addr) {
+            // CD-ROM controller.
+            by_width(7, 13, 25)
+        } else {
+            // The other I/O ports: about 3 cycles in total.
+            2
+        }
+    }
+
+    /// Charges the time of a CPU read to the clock (see `take_stall`).
+    pub fn charge_read(&mut self, vaddr: u32, width: Width) {
+        self.stall += Self::read_delay(vaddr, width);
     }
 
     /// Tells whether anything answers at `vaddr`, without accessing it
@@ -432,9 +503,8 @@ impl Bus {
     //
     // psx-spx: "DMA Channels". Burst and slice transfers complete at once
     // and their duration (1 clk/word, "DMA Transfer Rates") is charged to
-    // `stall`; linked lists advance one node per `tick` so that the CPU keeps
-    // running between nodes ("CPU operation resumes ... after SyncMode 2
-    // list entries") and an endless list cannot hang the emulator.
+    // `stall`; linked lists advance a slice of nodes per `tick`
+    // (`LIST_NODES_PER_SLICE`), each charged the same way.
     // Deviation: chopping (CHCR bit 8) is ignored.
 
     /// Starts every channel that is enabled, has its start bit set and has
@@ -892,7 +962,7 @@ mod tests {
     }
 
     #[test]
-    fn gpu_linked_list_runs_one_node_per_tick() {
+    fn gpu_linked_list_is_sent_when_the_bus_is_ticked() {
         // psx-spx: "Linked List DMA".
         let mut b = bus();
         b.store32(0x2000, 0x0200_3000).unwrap(); // 2 words, next = 0x3000
@@ -904,16 +974,33 @@ mod tests {
         b.store32(0x1F80_10A4, 0).unwrap();
         b.store32(0x1F80_10A8, 0x0100_0401).unwrap();
         assert_eq!(b.gp0_words(), 0, "nothing until the bus is ticked");
+        assert_ne!(b.load32(0x1F80_10A8).unwrap() & (1 << 24), 0, "busy");
 
         b.tick(1);
         assert_eq!(b.gp0_words(), 2);
-        assert_eq!(b.load32(0x1F80_10A0).unwrap(), 0x3000);
-        assert_ne!(b.load32(0x1F80_10A8).unwrap() & (1 << 24), 0, "still busy");
-        assert_eq!(b.take_stall(), 3);
-
-        b.tick(1);
-        assert_eq!(b.load32(0x1F80_10A0).unwrap(), 0x00FF_FFFF);
+        assert_eq!(b.load32(0x1F80_10A0).unwrap(), 0x00FF_FFFF, "MADR holds the end marker");
         assert_eq!(b.load32(0x1F80_10A8).unwrap(), 0x0000_0401, "complete");
+        assert_eq!(b.take_stall(), 4, "one cycle per word, headers included");
+    }
+
+    #[test]
+    fn long_lists_go_out_in_slices_between_instructions() {
+        // A chain of 100 empty nodes: 64 on the first tick, the rest on the
+        // second (LIST_NODES_PER_SLICE).
+        let mut b = bus();
+        for i in 0..100u32 {
+            let next = if i == 99 { 0x00FF_FFFF } else { 0x2000 + 4 * (i + 1) };
+            b.store32(0x2000 + 4 * i, next).unwrap();
+        }
+        b.store32(DPCR, 0x0765_4B21).unwrap();
+        b.store32(0x1F80_10A0, 0x2000).unwrap();
+        b.store32(0x1F80_10A8, 0x0100_0401).unwrap();
+        b.tick(1);
+        assert_eq!(b.load32(0x1F80_10A0).unwrap(), 0x2000 + 4 * 64);
+        assert_ne!(b.load32(0x1F80_10A8).unwrap() & (1 << 24), 0, "still busy");
+        b.tick(1);
+        assert_eq!(b.load32(0x1F80_10A8).unwrap() & (1 << 24), 0);
+        assert_eq!(b.take_stall(), 100);
     }
 
     #[test]
@@ -1070,5 +1157,27 @@ mod tests {
         assert_eq!(replies, [0xFF, 0x41, 0x5A, 0xEF, 0xFF]);
         assert_ne!(b.irq.stat() & (1 << 7), 0, "IRQ7 from /ACK");
         assert!(b.unhandled().is_empty());
+    }
+
+    #[test]
+    fn read_delays_follow_the_console_measurements() {
+        // ps1-tests cpu/access-time psx.log: RAM 5.2, BIOS 7.6/12.9/24.9,
+        // scratchpad ~1, I/O ~3, expansion 2 11/26/56, SPUCNT 18/18/39,
+        // CD-ROM 8/14/26 cycles per load instruction.
+        use Width::{Byte, Half, Word};
+        assert_eq!(Bus::read_delay(0x8000_0000, Word), 4);
+        assert_eq!(Bus::read_delay(0x0000_1000, Byte), 4);
+        assert_eq!([Bus::read_delay(0xBFC0_0000, Byte), Bus::read_delay(0xBFC0_0000, Half), Bus::read_delay(0xBFC0_0000, Word)], [7, 12, 24]);
+        assert_eq!(Bus::read_delay(0x1F80_0000, Word), 0);
+        assert_eq!(Bus::read_delay(0xFFFE_0130, Word), 0);
+        assert_eq!(Bus::read_delay(0x1F80_1070, Word), 2);
+        assert_eq!(Bus::read_delay(0x1F80_1814, Word), 2);
+        assert_eq!(Bus::read_delay(0x1F80_2000, Word), 55);
+        assert_eq!(Bus::read_delay(0x1F80_1DAA, Half), 17);
+        assert_eq!(Bus::read_delay(0x1F80_1800, Byte), 7);
+        let mut b = bus();
+        b.charge_read(0x8000_0000, Word);
+        b.charge_read(0xBFC0_0000, Word);
+        assert_eq!(b.take_stall(), 28);
     }
 }
