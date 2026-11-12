@@ -865,14 +865,14 @@ mod tests {
     #[test]
     fn io_accesses_are_recorded_once() {
         let mut b = bus();
-        // Devices that are still missing: SIO1 and the SPU's reverb.
+        // Still missing: SIO1 and the SPU's unknown registers.
         b.store32(0x1F80_1050, 0xB88).unwrap();
         b.store32(0x1F80_1050, 0xB88).unwrap();
-        b.load16(0x1F80_1DC0).unwrap(); // SPU reverb
+        b.load16(0x1F80_1E60).unwrap(); // SPU, unknown register
         assert_eq!(b.unhandled().len(), 2);
         assert_eq!(b.unhandled()[0].addr, 0x1F80_1050);
         assert_eq!(b.unhandled()[0].kind, AccessKind::Store);
-        assert_eq!(b.unhandled()[1].addr, 0x1F80_1DC0);
+        assert_eq!(b.unhandled()[1].addr, 0x1F80_1E60);
     }
 
     #[test]
@@ -1213,9 +1213,9 @@ mod tests {
     #[test]
     fn spu_registers_are_reachable_and_unimplemented_ones_reported() {
         let mut b = bus();
-        b.store16(0x1F80_1DC0, 0x1234).unwrap(); // reverb: not emulated
-        assert_eq!(b.load16(0x1F80_1DC0).unwrap(), 0x1234);
-        assert!(b.unhandled().iter().any(|a| a.addr == 0x1F80_1DC0));
+        b.store16(0x1F80_1E60, 0x1234).unwrap(); // "Unknown?" in psx-spx
+        assert_eq!(b.load16(0x1F80_1E60).unwrap(), 0x1234);
+        assert!(b.unhandled().iter().any(|a| a.addr == 0x1F80_1E60));
         // Voice registers are implemented.
         b.store16(0x1F80_1C00, 0x1234).unwrap();
         assert_eq!(b.load16(0x1F80_1C00).unwrap(), 0x1234);

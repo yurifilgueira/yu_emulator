@@ -4,11 +4,11 @@
 //!
 //! Emulated: the register file, sound RAM transfers (manual and DMA), the
 //! 24 voices (ADPCM, pitch and pitch modulation, Gaussian interpolation,
-//! ADSR, noise), voice and main volumes with sweeps, CD audio input, the
-//! capture buffers and the SPU interrupt. One stereo sample is produced
-//! every 768 system clock cycles (44.1 kHz).
+//! ADSR, noise), voice and main volumes with sweeps, CD audio input,
+//! reverb, the capture buffers and the SPU interrupt. One stereo sample is
+//! produced every 768 system clock cycles (44.1 kHz).
 //!
-//! Not emulated: reverb, the external (PIO) input, the delay with which
+//! Not emulated: the external (PIO) input, the delay with which
 //! hardware applies register writes ("it may take 1/44100 seconds ... until
 //! it has actually realized the new value" — key on/off wait for the next
 //! sample, everything else is immediate) and transfer timing ("Data
@@ -16,11 +16,13 @@
 
 mod envelope;
 mod gauss;
+mod reverb;
 mod voice;
 
 use crate::bus::Width;
 use crate::irq::{Interrupt, Irq};
 use envelope::{Envelope, Rate};
+use reverb::Reverb;
 use voice::{Settings, Voice};
 
 /// psx-spx: "Additional Memory" — "512K Sound RAM".
@@ -48,6 +50,7 @@ const VOICE_REPEAT: usize = 0xE;
 const VOICE_REGISTERS_END: usize = 0x180;
 /// psx-spx: "MVOLL (main volume left)", right at +2.
 const MAIN_VOLUME: usize = 0x180;
+/// psx-spx: "EVOLL volume Reverb Output Volume Left", right at +2.
 const REVERB_VOLUME: usize = 0x184;
 const KEY_ON: usize = 0x188;
 const KEY_OFF: usize = 0x18C;
@@ -55,10 +58,10 @@ const KEY_OFF: usize = 0x18C;
 const PITCH_MODULATION: usize = 0x190;
 /// psx-spx: "NON0 (voice 0..15 noise enable)".
 const NOISE_ON: usize = 0x194;
+/// psx-spx: "EON0 (voice 0..15 echo/reverb enable)".
 const REVERB_ON: usize = 0x198;
 /// psx-spx: "ENDX0 (voice 0..15 end reached, read-only)".
 const ENDX: usize = 0x19C;
-const REVERB_BASE: usize = 0x1A2;
 /// psx-spx: "0x1f801da4: IRQA (IRQ address)".
 const IRQ_ADDRESS: usize = 0x1A4;
 /// psx-spx: "0x1f801da6: TSA (transfer start address)".
@@ -75,7 +78,6 @@ const STATX: usize = 0x1AE;
 const CD_VOLUME: usize = 0x1B0;
 /// psx-spx: "MVOLXL (current main volume left)", right at +2.
 const MAIN_VOLUME_CURRENT: usize = 0x1B8;
-const REVERB_REGISTERS: usize = 0x1C0;
 /// psx-spx: "VOLXL (current voice volume left)" at N*4, right at +2.
 const VOICE_VOLUME_CURRENT: usize = 0x200;
 const VOICE_VOLUME_CURRENT_END: usize = 0x260;
@@ -83,7 +85,9 @@ const VOICE_VOLUME_CURRENT_END: usize = 0x260;
 // ATTR bits.
 const ATTR_ENABLE: u16 = 1 << 15;
 const ATTR_UNMUTE: u16 = 1 << 14;
+const ATTR_REVERB_ENABLE: u16 = 1 << 7;
 const ATTR_IRQ_ENABLE: u16 = 1 << 6;
+const ATTR_CD_REVERB: u16 = 1 << 2;
 const ATTR_CD_ENABLE: u16 = 1 << 0;
 
 /// ATTR bits 5-4: "Sound RAM Transfer Mode (0=Stop, 1=ManualWrite,
@@ -152,6 +156,7 @@ pub struct Spu {
     /// psx-spx: "SPU Noise Generator".
     noise_timer: i32,
     noise_level: u16,
+    reverb: Reverb,
     /// Write position inside the capture buffers (0..3FEh).
     capture: usize,
     /// STATX bit 6, and a request not yet passed to the interrupt
@@ -177,6 +182,7 @@ impl Default for Spu {
             endx: 0,
             noise_timer: 0,
             noise_level: 0,
+            reverb: Reverb::default(),
             capture: 0,
             irq_flag: false,
             irq_request: false,
@@ -188,13 +194,10 @@ impl Default for Spu {
 
 impl Spu {
     /// Registers whose behaviour is implemented; accesses to the others
-    /// (reverb, unknown ones) are reported by the bus as unhandled.
+    /// (1F801E60h and up, "Unknown?" in psx-spx) are reported by the bus as
+    /// unhandled.
     pub fn is_implemented(offset: u32) -> bool {
-        let offset = offset as usize & !1;
-        match offset {
-            REVERB_VOLUME..KEY_ON | REVERB_ON..ENDX | REVERB_BASE => false,
-            _ => offset < REVERB_REGISTERS || (VOICE_VOLUME_CURRENT..VOICE_VOLUME_CURRENT_END).contains(&offset),
-        }
+        (offset as usize) < VOICE_VOLUME_CURRENT_END
     }
 
     pub fn ram(&self) -> &[u8] {
@@ -297,6 +300,7 @@ impl Spu {
             // "does additionally store the value (multiplied by 8) in
             // another internal 'current address' register".
             TSA => self.address = value as usize * 8 % RAM_SIZE,
+            reverb::BASE => self.reverb.set_base(value),
             FIFO => {
                 if self.fifo.len() < FIFO_CAPACITY {
                     self.fifo.push(value);
@@ -423,8 +427,10 @@ impl Spu {
         let (key_on, key_off) = (std::mem::take(&mut self.key_on), std::mem::take(&mut self.key_off));
         let pitch_modulation = self.reg32(PITCH_MODULATION);
         let noise_on = self.reg32(NOISE_ON);
+        let reverb_on = self.reg32(REVERB_ON);
 
         let mut mix = [0i32; 2];
+        let mut reverb_input = [0i32; 2];
         let mut previous = 0i16;
         for n in 0..VOICES {
             let bit = 1u32 << n;
@@ -463,7 +469,12 @@ impl Spu {
             previous = self.voices[n].output;
             for (side, total) in mix.iter_mut().enumerate() {
                 self.volumes[n][side].tick();
-                *total += self.volumes[n][side].apply(previous as i32);
+                let sample = self.volumes[n][side].apply(previous as i32);
+                *total += sample;
+                // EON: "(0=To Mixer, 1=To Mixer and to Reverb)".
+                if reverb_on & bit != 0 {
+                    reverb_input[side] += sample;
+                }
             }
         }
 
@@ -489,11 +500,30 @@ impl Spu {
         // ATTR bits 15 and 14 silence the voices but "Don't care for CD
         // Audio"; bit 0 lets the CD in, scaled by AVOLL/AVOLR.
         let voices_audible = attr & (ATTR_ENABLE | ATTR_UNMUTE) == ATTR_ENABLE | ATTR_UNMUTE;
-        std::array::from_fn(|side| {
+        let mut totals: [i32; 2] = std::array::from_fn(|side| {
             let mut total = if voices_audible { mix[side].clamp(-0x8000, 0x7FFF) } else { 0 };
-            if attr & ATTR_CD_ENABLE != 0 {
-                total += (cd[side] as i32 * self.reg16(CD_VOLUME + side * 2) as i16 as i32) >> 15;
+            if !voices_audible {
+                reverb_input[side] = 0;
             }
+            if attr & ATTR_CD_ENABLE != 0 {
+                let sample = (cd[side] as i32 * self.reg16(CD_VOLUME + side * 2) as i16 as i32) >> 15;
+                total += sample;
+                // ATTR bit 2: "I2SA (CD-ROM) Reverb Enable".
+                if attr & ATTR_CD_REVERB != 0 {
+                    reverb_input[side] += sample;
+                }
+            }
+            total
+        });
+        // The reverb's output is added to the mix with its own volume.
+        // Deviation: psx-spx does not say whether the main volume applies
+        // to it; it does here.
+        let reverb = self.reverb.tick(&self.regs, &mut self.ram, reverb_input, attr & ATTR_REVERB_ENABLE != 0);
+        for side in 0..2 {
+            totals[side] += (reverb[side] * self.reg16(REVERB_VOLUME + side * 2) as i16 as i32) >> 15;
+        }
+        std::array::from_fn(|side| {
+            let total = totals[side];
             self.volumes[VOICES][side].tick();
             self.volumes[VOICES][side].apply(total.clamp(-0x8000, 0x7FFF)).clamp(-0x8000, 0x7FFF) as i16
         })
@@ -858,5 +888,44 @@ mod tests {
         key_on(&mut spu, 2);
         let out = run(&mut spu, 30);
         assert!(out[10..].iter().any(|s| s[0] > 0x1000) && out[10..].iter().any(|s| s[0] < -0x1000), "{out:?}");
+    }
+
+    #[test]
+    fn a_voice_routed_to_the_reverb_echoes_after_it_stops() {
+        // psx-spx: EON, EVOLL/EVOLR, ATTR bit 7. A short work area used as
+        // a plain delay: the input is written at 40h units and read by
+        // comb 1 at 20h units, 80h steps of 22050 Hz later.
+        let mut spu = playing(0, &[block(0x00, 7, 0x7)]);
+        store16(&mut spu, ATTR, 0xC080);
+        store16(&mut spu, REVERB_ON, 1);
+        store16(&mut spu, REVERB_VOLUME, 0x7FFF);
+        store16(&mut spu, REVERB_VOLUME + 2, 0x7FFF);
+        store16(&mut spu, reverb::BASE, 0xFF00); // 800h bytes
+        for (register, value) in [
+            (0x1FC, 0x7FFF), (0x1FE, 0x7FFF), // vLIN, vRIN
+            (0x1C4, 0x7FFF),                 // vIIR
+            (0x1C6, 0x7FFF),                 // vCOMB1
+            (0x1D4, 0x40), (0x1D6, 0x48),    // mLSAME, mRSAME
+            (0x1D8, 0x20), (0x1DA, 0x28),    // mLCOMB1, mRCOMB1
+            (0x1F4, 0x80), (0x1F6, 0x88),    // mLAPF1, mRAPF1
+            (0x1F8, 0xA0), (0x1FA, 0xA8),    // mLAPF2, mRAPF2
+        ] {
+            store16(&mut spu, register, value);
+        }
+        // Unused taps: somewhere quiet.
+        for register in [0x1DC, 0x1DE, 0x1E0, 0x1E2, 0x1E4, 0x1E6, 0x1E8, 0x1EA, 0x1EC, 0x1EE, 0x1F0, 0x1F2] {
+            store16(&mut spu, register, 0xE0);
+        }
+        key_on(&mut spu, 0);
+        let dry = run(&mut spu, 100)[99][0] as i32;
+        // Silence the voice at once (ENVX = 0 with the envelope stuck).
+        store16(&mut spu, VOICE_ENVX, 0);
+        let after = run(&mut spu, 400);
+        assert_eq!(after[60], [0, 0], "the voice itself is silent");
+        // 80h steps = 100h samples after its start the echo arrives, at
+        // about the dry level on the left and a quarter of it on the right.
+        let [left, right] = after[230];
+        assert!((left as i32 - dry).abs() < dry / 16, "{left:04X} {dry:04X}");
+        assert!((right as i32 - dry / 4).abs() < dry / 16, "{right:04X}");
     }
 }
