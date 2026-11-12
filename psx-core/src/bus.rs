@@ -21,6 +21,7 @@ use crate::dma::{self, Dma, SyncMode};
 use crate::gpu::Gpu;
 use crate::irq::{Interrupt, Irq};
 use crate::map::{self, mask_region};
+use crate::mdec::Mdec;
 use crate::sio::Sio0;
 use crate::spu::Spu;
 use crate::timers::Timers;
@@ -142,6 +143,7 @@ pub struct Bus {
     /// Controller and memory card port.
     pub sio0: Sio0,
     pub cdrom: Cdrom,
+    pub mdec: Mdec,
     /// Distinct unhandled accesses, in first-seen order.
     unhandled: Vec<UnhandledAccess>,
     unhandled_seen: HashSet<UnhandledAccess>,
@@ -173,6 +175,7 @@ impl Bus {
             spu: Spu::default(),
             sio0: Sio0::default(),
             cdrom: Cdrom::default(),
+            mdec: Mdec::default(),
             unhandled: Vec::new(),
             unhandled_seen: HashSet::new(),
         })
@@ -419,6 +422,9 @@ impl Bus {
             // psx-spx: "GPU I/O Ports" — GPUREAD and GPUSTAT.
             0x1F80_1810 => self.gpu.read(),
             0x1F80_1814 => self.gpu.status(),
+            // psx-spx: "MDEC I/O Ports".
+            0x1F80_1820 => self.mdec.read(),
+            0x1F80_1824 => self.mdec.status(),
             _ => {
                 if let Some(off) = map::SPU.contains(addr) {
                     if !Spu::is_implemented(off) {
@@ -489,6 +495,16 @@ impl Bus {
             0x1F80_1100..=0x1F80_112F => self.timers.write(reg - 0x1F80_1100, value),
             0x1F80_1810 => self.gp0(value),
             0x1F80_1814 => self.gpu.gp1(value),
+            0x1F80_1820 | 0x1F80_1824 => {
+                if reg == 0x1F80_1820 {
+                    self.mdec.write(value);
+                } else {
+                    self.mdec.write_control(value);
+                }
+                // Decoded data or an enabled request may start a waiting
+                // DMA0 or DMA1 transfer.
+                self.dma_start_ready_channels();
+            }
             _ => {
                 if let Some(off) = map::SPU.contains(addr) {
                     if !Spu::is_implemented(off) {
@@ -534,9 +550,11 @@ impl Bus {
             // The GPU executes commands instantly, so it is always ready
             // for data (deviation: GP1(04h) "DMA Direction" is not checked).
             // The SPU requests data while a DMA transfer mode is selected.
-            // The CD-ROM requests while its sector buffer has bytes.
-            // No other device exists yet.
+            // The CD-ROM requests while its sector buffer has bytes, the
+            // MDEC as its control register and output queue say.
             let dreq = match n {
+                dma::CHANNEL_MDEC_IN => self.mdec.dma_in_request(),
+                dma::CHANNEL_MDEC_OUT => self.mdec.dma_out_request(Self::dma_words(&channel) as usize),
                 dma::CHANNEL_GPU => true,
                 dma::CHANNEL_CDROM => self.cdrom.data_ready(),
                 dma::CHANNEL_SPU => self.spu.dma_request(),
@@ -553,7 +571,10 @@ impl Bus {
                         self.dma_list_active = true;
                     }
                 }
-                (dma::CHANNEL_GPU | dma::CHANNEL_SPU, SyncMode::Burst | SyncMode::Slice) => self.dma_block(n),
+                (
+                    dma::CHANNEL_MDEC_IN | dma::CHANNEL_MDEC_OUT | dma::CHANNEL_GPU | dma::CHANNEL_SPU,
+                    SyncMode::Burst | SyncMode::Slice,
+                ) => self.dma_block(n),
                 (dma::CHANNEL_CDROM, SyncMode::Burst) => self.dma_block(n),
                 // Device not implemented (or reserved sync mode): the
                 // transfer stays pending, as if DREQ never came.
@@ -588,6 +609,16 @@ impl Bus {
         }
     }
 
+    /// Words a burst or slice transfer moves: BCR's word count, or in
+    /// slice mode block size times number of blocks.
+    fn dma_words(channel: &dma::Channel) -> u32 {
+        if channel.sync_mode() == SyncMode::Slice {
+            Self::dma_count(channel.bcr) * Self::dma_count(channel.bcr >> 16)
+        } else {
+            Self::dma_count(channel.bcr)
+        }
+    }
+
     /// DMA6: "OTC (reverse clear OT)". Writes a linked list of empty nodes
     /// from MADR downwards; the last word is the FFFFFFh end marker.
     fn dma_otc(&mut self) {
@@ -617,11 +648,7 @@ impl Bus {
         self.dma.begin(n);
         let channel = self.dma.channels[n];
         let slice = channel.sync_mode() == SyncMode::Slice;
-        let words = if slice {
-            Self::dma_count(channel.bcr) * Self::dma_count(channel.bcr >> 16)
-        } else {
-            Self::dma_count(channel.bcr)
-        };
+        let words = Self::dma_words(&channel);
         let mut addr = channel.madr & 0x00FF_FFFC;
         let mut in_ram = true;
         for _ in 0..words {
@@ -629,6 +656,7 @@ impl Bus {
                 match (self.dma_read(addr), n) {
                     (Some(word), dma::CHANNEL_GPU) => self.gp0(word),
                     (Some(word), dma::CHANNEL_SPU) => self.spu.dma_write(word),
+                    (Some(word), dma::CHANNEL_MDEC_IN) => self.mdec.write(word),
                     // The CD-ROM channel only transfers to RAM.
                     (Some(_), _) => {}
                     (None, _) => in_ram = false,
@@ -638,6 +666,7 @@ impl Bus {
                 let word = match n {
                     dma::CHANNEL_GPU => self.gpu.read(),
                     dma::CHANNEL_SPU => self.spu.dma_read(),
+                    dma::CHANNEL_MDEC_OUT => self.mdec.read(),
                     // DMA3 reads the sector buffer, as RDDATA does.
                     _ => u32::from_le_bytes(std::array::from_fn(|_| self.cdrom.read_data())),
                 };
@@ -1082,10 +1111,10 @@ mod tests {
     #[test]
     fn dma_to_missing_device_stays_pending_and_is_reported() {
         let mut b = bus();
-        b.store32(DPCR, 0x0765_4329).unwrap(); // enable channel 0 (MDEC in)
-        b.store32(0x1F80_1088, 0x1100_0000).unwrap();
-        assert_eq!(b.load32(0x1F80_1088).unwrap(), 0x1100_0000);
-        assert!(b.unhandled().iter().any(|a| a.addr == 0x1F80_1088));
+        b.store32(DPCR, 0x07E5_4321).unwrap(); // enable channel 5 (PIO)
+        b.store32(0x1F80_10D8, 0x1100_0000).unwrap();
+        assert_eq!(b.load32(0x1F80_10D8).unwrap(), 0x1100_0000);
+        assert!(b.unhandled().iter().any(|a| a.addr == 0x1F80_10D8));
     }
 
     #[test]
@@ -1133,6 +1162,46 @@ mod tests {
         assert_eq!(b.load32(0x1F80_10B8).unwrap() & 0x0100_0000, 0, "finished");
         assert_eq!(b.take_stall(), 0x200 * 24, "24 clks/word");
         assert_eq!(b.load8(0x1F80_1800).unwrap() & 0x40, 0, "buffer empty");
+    }
+
+    #[test]
+    fn mdec_decodes_through_dma0_and_dma1() {
+        // psx-spx "MDEC I/O Ports" — "DMA0 (MDEC.In) to send compressed
+        // data from RAM to MDEC", "DMA1 (MDEC.Out) to send uncompressed
+        // macroblocks from MDEC to RAM".
+        let mut b = bus();
+        b.store32(0x1F80_1824, 0x8000_0000).unwrap();
+        b.store32(0x1F80_1824, 0x6000_0000).unwrap();
+        assert_eq!(b.load32(0x1F80_1824).unwrap(), 0x9004_0000);
+        for word in crate::mdec::tests::setup_words(2, 2) {
+            b.store32(0x1F80_1820, word).unwrap();
+        }
+        // One grey 15-bit macroblock: Cr and Cb with DC 0, four Y blocks
+        // with DC 100 (scale 1), each followed by the end code. Padded with
+        // FE00h to 20h words, as psx-spx recommends.
+        let mut words = vec![0xFE00_0400u32, 0xFE00_0400, 0xFE00_0464, 0xFE00_0464, 0xFE00_0464, 0xFE00_0464];
+        words.resize(0x20, 0xFE00_FE00);
+        for (i, word) in words.iter().enumerate() {
+            b.store32(0x8001_0000 + 4 * i as u32, *word).unwrap();
+        }
+        b.store32(DPCR, 0x0765_43BB).unwrap(); // enable channels 0 and 1
+
+        // The output transfer is started first and waits for data.
+        b.store32(0x1F80_1090, 0x0002_0000).unwrap();
+        b.store32(0x1F80_1094, 0x0004_0020).unwrap(); // 4 blocks of 20h words
+        b.store32(0x1F80_1098, 0x0100_0200).unwrap();
+        assert_ne!(b.load32(0x1F80_1098).unwrap() & 0x0100_0000, 0, "waiting");
+
+        b.store32(0x1F80_1820, 0x3800_0020).unwrap(); // decode, 20h words
+        b.store32(0x1F80_1080, 0x0001_0000).unwrap();
+        b.store32(0x1F80_1084, 0x0001_0020).unwrap();
+        b.store32(0x1F80_1088, 0x0100_0201).unwrap();
+        assert_eq!(b.load32(0x1F80_1088).unwrap() & 0x0100_0000, 0, "input done");
+        assert_eq!(b.load32(0x1F80_1098).unwrap() & 0x0100_0000, 0, "output done");
+        assert_eq!(b.load32(0x8002_0000).unwrap(), 0x4E73_4E73);
+        assert_eq!(b.load32(0x8002_01FC).unwrap(), 0x4E73_4E73);
+        assert_eq!(b.load32(0x8002_0200).unwrap(), 0);
+        assert_eq!(b.load32(0x1F80_1824).unwrap() & 0xA000_0000, 0x8000_0000, "idle, output empty");
     }
 
     // ---- stubs for later phases ------------------------------------------
