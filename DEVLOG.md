@@ -17,6 +17,69 @@ Model: claude-fable-5-2 · Session time: Xh · Human interventions: N
 
 ---
 
+## 2026-11-12 — Phase 7 (second part): SPU and CD sound
+
+Model: claude-fable-5-2 · Session time: ~3h (estimate, not measured) · Human interventions: 0
+
+- Done (branch `phase-7-spu`, on top of `phase-7-mdec`, pull request):
+  - `psx-core/src/spu/`: `voice.rs` (ADPCM decoding with the five
+    filters, pitch counter and pitch modulation, 4-point Gaussian
+    interpolation, ADSR phases, loop flags), `envelope.rs` (the envelope
+    generator shared by ADSR and volume sweeps), `gauss.rs` (the table),
+    `reverb.rs` (the reverb formula at 22050 Hz with the 39-tap filter).
+  - `psx-core/src/spu.rs`: key on/off, ENDX, ENVX, repeat address, voice
+    and main volumes with sweeps, noise generator, capture buffers, IRQ9
+    on voice reads, transfers and captures, CD input, mixing; one stereo
+    sample per 768 cycles.
+  - `psx-core/src/xa.rs`: XA-ADPCM sectors to 44.1 kHz with the zigzag
+    interpolation tables. `cdrom.rs`: XA sectors and CD-DA tracks feed
+    the SPU; ATV0-3, ADPCTL, Mute/Demute.
+  - Harness: `--audio-out file.wav`. Frontend: sound through cpal, with a
+    queue and a linear resampler to the device's rate; `--mute`.
+  - 335 unit tests (313 core, 12 harness, 10 frontend).
+- Results (Sony BIOS SCPH-1001), all from WAV files written by the
+  harness and analysed with a script (peak per second, share of saturated
+  samples, lag-1 autocorrelation, zero crossings):
+  - BIOS, no disc: silence, then sound from second 2 to 9, peak 29279 with
+    reverb (24979 without).
+  - Symphony of the Night to the title screen: BIOS sound, then the
+    opening video's sound, then the menu's. The video's loudest second
+    saturates in 0.2% of its samples on the right channel; the signal is
+    smooth (autocorrelation 0.999), so it is sound and not decoding noise.
+  - Unhandled I/O in the BIOS run is down to one address (1F802041h, the
+    POST display).
+  - 800 M cycles took 53 s against 49 s before the SPU.
+- **I cannot hear.** Whether any of this sounds right is not established.
+  The measurements rule out silence, noise and gross clipping, nothing
+  more. The frontend opened the sound device without error on the
+  development machine and may have played the BIOS chime for 5 seconds.
+- Broke / surprised us (all found by the unit tests before any run):
+  - The gauss and zigzag tables were copied from psx-spx by scripts; my
+    first slice of the gauss table missed its first row (504 values
+    instead of 512, caught by an assertion in the script). The gauss sums
+    match the range psx-spx states (7F7Fh..7F81h).
+  - I assumed the XA interpolation tables had unity gain. They sum to
+    about 7400h (0.906) each, all seven alike; the tests now state that.
+    Whether the hardware really attenuates by that much or psx-spx's
+    tables are scaled is not known to me.
+  - Several of my test expectations were wrong, not the code: decay ends
+    at once when the sustain level is already reached; a capture buffer
+    half is 100h samples, not 200h; an interrupt on a looping voice comes
+    back after the whole loop, not one block; two rounding slips in the
+    all-pass test; left and right reverb taps crossing in the 128-byte
+    buffer I had chosen (the test now uses a 32 KB one with the layout
+    explained).
+  - `Disc`-borrow and clippy (`chunks_exact`, needless `mut`) fixes.
+- Deviations, commented in the code: register writes take effect at once
+  (key on/off at the next sample); the repeat address is set to the start
+  address at key on; envelope counter restarts from zero after a step;
+  ADPCM filters 5-7 act as 0; reverb computes both sides in one step, has
+  no IRQ and no vIIR = -8000h bug, and its output goes through the main
+  volume; XA: no 8-bit samples, no emphasis, 18900 Hz by doubling; a data
+  track played as audio is silent; no transfer-busy timing.
+- Human stepped in for: nothing.
+- Next: the owner listens. Then Phase 8 (compatibility table, speed).
+
 ## 2026-11-12 — Phase 7 (first part): MDEC
 
 Model: claude-fable-5-2 · Session time: ~1h (estimate, not measured) · Human interventions: 0

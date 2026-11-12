@@ -21,6 +21,7 @@ pub mod spu;
 pub mod system;
 pub mod timers;
 pub mod video;
+pub mod xa;
 
 pub use bus::{BiosError, Bus, BusFault};
 pub use cpu::Cpu;

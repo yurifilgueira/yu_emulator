@@ -7,13 +7,15 @@
 //! INT3 acknowledges a command, INT2 reports its completion, INT1 announces
 //! a sector (or a play report), INT4 the end of a track and INT5 an error.
 //!
-//! Not emulated: XA-ADPCM and CD-DA audio output (sectors meant for the
-//! audio decoder are skipped; playing only moves the position), sound map,
-//! the audio volume registers, seek times that depend on distance, drive
-//! door, multiple sessions, most test commands and the unlock commands.
+//! Sound: XA-ADPCM sectors and CD-DA tracks are turned into 44.1 kHz stereo
+//! samples that the SPU fetches with [`Cdrom::audio_sample`].
+//!
+//! Not emulated: sound map, seek times that depend on distance, drive door,
+//! multiple sessions, most test commands and the unlock commands.
 
 use crate::disc::{from_bcd, Disc, Msf, SECTORS_PER_SECOND};
 use crate::irq::{Interrupt, Irq};
+use crate::xa;
 use std::collections::VecDeque;
 
 // psx-spx: "0x1f801803 (read, banks 1 and 3): HINTSTS".
@@ -146,6 +148,16 @@ pub struct Cdrom {
     /// Sector buffer being read through RDDATA.
     data: Vec<u8>,
     data_pos: usize,
+
+    xa: xa::Decoder,
+    /// Decoded sound waiting for the SPU.
+    audio: VecDeque<[i16; 2]>,
+    /// ATV0-3 as written, and as applied by ADPCTL bit 5: L->L, L->R,
+    /// R->R, R->L.
+    volume_written: [u8; 4],
+    volume: [u8; 4],
+    /// ADPCTL bit 0: "Mute XA-ADPCM".
+    xa_muted: bool,
 }
 
 impl Default for Cdrom {
@@ -183,6 +195,12 @@ impl Cdrom {
             pending_sector: None,
             data: Vec::new(),
             data_pos: 0,
+            xa: xa::Decoder::default(),
+            audio: VecDeque::new(),
+            // psx-spx: 'values "80h,0,80h,0" produce normal stereo volume'.
+            volume_written: [0x80, 0, 0x80, 0],
+            volume: [0x80, 0, 0x80, 0],
+            xa_muted: false,
         }
     }
 
@@ -306,8 +324,21 @@ impl Cdrom {
                     }
                 }
             }
-            // WRDATA, CI, ATV0-3, ADPCTL: sound map and audio volume, not
-            // emulated.
+            // psx-spx: ATV0 (L->L), ATV1 (L->R), ATV2 (R->R), ATV3 (R->L):
+            // "After changing these registers, the CHNGATV flag in ADPCTL
+            // must be set".
+            (2, 2) => self.volume_written[0] = value,
+            (3, 2) => self.volume_written[1] = value,
+            (1, 3) => self.volume_written[2] = value,
+            (2, 3) => self.volume_written[3] = value,
+            // ADPCTL: bit 0 "Mute XA-ADPCM", bit 5 "Apply ATV0-ATV3".
+            (3, 3) => {
+                self.xa_muted = value & 0x01 != 0;
+                if value & 0x20 != 0 {
+                    self.volume = self.volume_written;
+                }
+            }
+            // WRDATA and CI (sound map): not emulated.
             _ => {}
         }
     }
@@ -319,6 +350,31 @@ impl Cdrom {
         if self.int_flags & self.int_enable != 0 {
             irq.request(Interrupt::Cdrom);
         }
+    }
+
+    // ---- sound -------------------------------------------------------------
+
+    /// One stereo sample of CD sound at 44.1 kHz for the SPU's CD input,
+    /// silence when nothing is playing.
+    pub fn audio_sample(&mut self) -> [i16; 2] {
+        let Some([left, right]) = self.audio.pop_front() else { return [0, 0] };
+        // psx-spx: ATV0-3 — 80h is normal volume, and "the saturation works
+        // up to double volume". Mute "is just forcing the CD output volume
+        // to zero".
+        if self.muted {
+            return [0, 0];
+        }
+        let [ll, lr, rr, rl] = self.volume.map(|v| v as i32);
+        let mix = |a: i16, va: i32, b: i16, vb: i32| ((a as i32 * va + b as i32 * vb) >> 7).clamp(-0x8000, 0x7FFF) as i16;
+        [mix(left, ll, right, rl), mix(right, rr, left, lr)]
+    }
+
+    /// Queues decoded sound, dropping the oldest if the SPU is not keeping
+    /// up (about a second is kept).
+    fn limit_audio(&mut self) {
+        const LIMIT: usize = 44_100;
+        let excess = self.audio.len().saturating_sub(LIMIT);
+        self.audio.drain(..excess);
     }
 
     // ---- time --------------------------------------------------------------
@@ -544,6 +600,7 @@ impl Cdrom {
             // all commands."
             0x0A => {
                 self.mode = MODE_WHOLE_SECTOR;
+                self.muted = false;
                 self.second = None;
                 self.queue.clear();
                 self.target = None;
@@ -737,13 +794,16 @@ impl Cdrom {
         self.last_header = Some(header);
 
         // psx-spx: "Data/ADPCM Sector Filtering/Delivery". Sectors that go
-        // to the XA-ADPCM decoder are not delivered as data; the decoder
-        // itself is not emulated, so they are dropped.
+        // to the XA-ADPCM decoder are not delivered as data.
         let (file, channel, submode) = (raw[16], raw[17], raw[18]);
         let realtime_audio = raw[15] == 2 && submode & 0x44 == 0x44;
         let filter = self.mode & MODE_XA_FILTER != 0;
         let filter_match = file == self.filter_file && channel == self.filter_channel;
         if realtime_audio && self.mode & MODE_XA_ADPCM != 0 && (!filter || filter_match) {
+            if !self.xa_muted {
+                self.xa.decode_sector(&raw, &mut self.audio);
+                self.limit_audio();
+            }
             return;
         }
         if filter && realtime_audio {
@@ -782,6 +842,15 @@ impl Cdrom {
                 vec![self.stat(), position[0], position[1], position[2], position[3] | 0x80, position[4], 0, 0]
             };
             self.push(INT_DATA_READY, bytes, None);
+        }
+        // An audio sector is 588 stereo samples, 16 bits, left first.
+        // Deviation: a data track "played" as audio gives silence here.
+        if track.audio {
+            if let Some(raw) = self.disc.as_ref().and_then(|d| d.sector(self.position)) {
+                let samples = raw.as_chunks::<4>().0.iter().map(|s| [i16::from_le_bytes([s[0], s[1]]), i16::from_le_bytes([s[2], s[3]])]);
+                self.audio.extend(samples);
+            }
+            self.limit_audio();
         }
         self.position = next;
     }
@@ -1137,5 +1206,101 @@ mod tests {
         // Ten sectors later a relative one, seconds with bit 7 set.
         let (_, bytes) = rig.wait(20_000_000).unwrap();
         assert_eq!(bytes, vec![STAT_MOTOR | STAT_PLAY, 0x02, 0x01, 0x00, 0x80, 0x10, 0, 0]);
+    }
+
+    // ---- sound -------------------------------------------------------------
+
+    fn xa_disc() -> Disc {
+        let mut data = data_track(40);
+        for lba in [30usize, 31] {
+            let sector = crate::xa::tests::sector(0x01, 0x00, 0x7777_7777);
+            // Keep the sync and header of the data track.
+            data[lba * SECTOR_SIZE + 16..(lba + 1) * SECTOR_SIZE].copy_from_slice(&sector[16..]);
+        }
+        Disc::from_data_track(data).unwrap()
+    }
+
+    #[test]
+    fn xa_sectors_are_decoded_into_cd_sound() {
+        // Setmode bit 6 "XA-ADPCM (0=Off, 1=Send XA-ADPCM sectors to SPU
+        // Audio Input)".
+        let mut rig = Rig::new(Some(xa_disc()));
+        assert_eq!(rig.cd.audio_sample(), [0, 0], "silence when nothing plays");
+        start_read(&mut rig, 30, 0x80 | 0x40);
+        // Sectors 30 and 31 go to the decoder; the next interrupt is the
+        // data sector 32.
+        rig.wait(10_000_000).unwrap();
+        assert_eq!(read_bytes(&mut rig, 1), [32]);
+        assert_eq!(rig.cd.audio.len(), 2 * 2352);
+        for _ in 0..1000 {
+            rig.cd.audio_sample();
+        }
+        let [left, right] = rig.cd.audio_sample();
+        assert!((0x6500..=0x6600).contains(&left) && left == right, "{left:04X} {right:04X}");
+    }
+
+    #[test]
+    fn xa_needs_the_mode_bit_and_obeys_adpctl_mute() {
+        // Without Setmode bit 6 the sectors are ordinary data.
+        let mut rig = Rig::new(Some(xa_disc()));
+        start_read(&mut rig, 30, 0x80);
+        rig.wait(10_000_000).unwrap();
+        assert!(rig.cd.audio.is_empty());
+        // ADPCTL bit 0 mutes XA-ADPCM.
+        let mut rig = Rig::new(Some(xa_disc()));
+        rig.cd.write(0, 3, &mut rig.irq);
+        rig.cd.write(3, 0x01, &mut rig.irq);
+        start_read(&mut rig, 30, 0x80 | 0x40);
+        rig.wait(10_000_000).unwrap();
+        assert!(rig.cd.audio.is_empty());
+    }
+
+    #[test]
+    fn cd_volume_matrix_and_mute() {
+        // psx-spx: ATV0-3, applied by ADPCTL bit 5; Mute/Demute commands.
+        let mut rig = Rig::new(Some(licensed_disc()));
+        let sample = |rig: &mut Rig| {
+            rig.cd.audio.push_back([1000, -3000]);
+            rig.cd.audio_sample()
+        };
+        assert_eq!(sample(&mut rig), [1000, -3000], "default 80h,0,80h,0");
+        // Mono: 40h everywhere. Not applied until ADPCTL bit 5 is written.
+        rig.cd.write(0, 2, &mut rig.irq);
+        rig.cd.write(2, 0x40, &mut rig.irq);
+        rig.cd.write(3, 0x40, &mut rig.irq);
+        rig.cd.write(0, 3, &mut rig.irq);
+        rig.cd.write(1, 0x40, &mut rig.irq);
+        rig.cd.write(2, 0x40, &mut rig.irq);
+        assert_eq!(sample(&mut rig), [1000, -3000]);
+        rig.cd.write(3, 0x20, &mut rig.irq);
+        assert_eq!(sample(&mut rig), [-1000, -1000]);
+        // Double volume saturates.
+        rig.cd.audio.push_back([0x7000, 0]);
+        rig.cd.volume = [0xFF, 0, 0xFF, 0];
+        assert_eq!(rig.cd.audio_sample(), [0x7FFF, 0]);
+        rig.cd.volume = [0x80, 0, 0x80, 0];
+        // Mute and Demute.
+        rig.run(0x0B, &[]);
+        assert_eq!(sample(&mut rig), [0, 0]);
+        rig.run(0x0C, &[]);
+        assert_eq!(sample(&mut rig), [1000, -3000]);
+    }
+
+    #[test]
+    fn playing_an_audio_track_produces_its_samples() {
+        // Track 2 holds 16-bit stereo samples; sector fill byte = sector
+        // number, so every sample of file sector 300 is 2C2Ch.
+        let cue = "FILE a BINARY\nTRACK 01 MODE2/2352\nINDEX 01 00:00:00\nTRACK 02 AUDIO\nINDEX 01 00:04:00\n";
+        let mut data = data_track(900);
+        data[300 * SECTOR_SIZE..301 * SECTOR_SIZE].fill(0x2C);
+        let mut rig = Rig::new(Some(Disc::from_cue(cue, |_| Ok(data.clone())).unwrap()));
+        rig.run(0x03, &[0x02]);
+        // The seek, then one sector time (with a little slack: the drive
+        // is advanced in steps of 1000 cycles).
+        for _ in 0..(SEEK_SECTORS + 1) * SECTOR_CYCLES / 1000 + 10 {
+            rig.cd.tick(1000, &mut rig.irq);
+        }
+        assert_eq!(rig.cd.audio.len(), 588);
+        assert_eq!(rig.cd.audio_sample(), [0x2C2C, 0x2C2C]);
     }
 }
