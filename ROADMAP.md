@@ -100,7 +100,7 @@ them pass and are recorded in `DEVLOG.md`.
     functions. The memory card is only covered by unit tests written from
     psx-spx; no program has read or written one.
 
-## Phase 6 — CD-ROM ✅ drive works; the first game stops at its intro video (needs MDEC, Phase 7)
+## Phase 6 — CD-ROM ✅ (the game available is 2D; no 3D game tried)
 
 - [x] `.bin/.cue` loading, command state machine, response timing
 - **Accept:** PlayStation logo boot sequence; first commercial 3D game is
@@ -113,17 +113,26 @@ them pass and are recorded in `DEVLOG.md`.
     it and opens the memory card manager and the CD player (the Phase 3 and
     Phase 5 items that were waiting for the drive). Copying or deleting
     saves in the manager has not been tried: there is no card with saves.
-  - First game: **not playable yet.** The only disc image available,
-    Castlevania: Symphony of the Night (NTSC-U), boots and then prints
-    "MDEC_out_sync timeout" for ever: it starts with a video and the video
-    decoder is Phase 7. It is also a 2D game; the 3D half of the criterion
+  - First game: Castlevania: Symphony of the Night (NTSC-U), the only disc
+    image available. With the CD-ROM alone it stopped at its opening video
+    ("MDEC_out_sync timeout"); with the MDEC of Phase 7 (2026-11-12) the
+    video plays, and scripted pad input goes through the title screen, the
+    file menu and name entry into the first stage, where the character
+    moves and the game pauses. Only that far has been played, by script
+    and without sound. It is a 2D game: the "3D" half of the criterion
     needs another disc from the owner.
   - Not emulated: XA-ADPCM and CD audio output (waits for the SPU), seek
     times, the drive door, most test commands.
 
-## Phase 7 — SPU and MDEC
+## Phase 7 — SPU and MDEC (MDEC done, SPU not started)
 
+- [x] MDEC: commands, run-length decoding, IDCT, colour conversion, DMA0/DMA1
+- [ ] SPU: voices, ADPCM, envelopes, reverb, CD audio and XA-ADPCM input
+- [ ] Audio output in the frontend
 - **Accept:** BIOS boot sound; music and FMVs in the first game.
+  Status on 2026-11-12: the opening video of Symphony of the Night plays
+  (checked by looking at single frames, not against a reference decoder).
+  No sound of any kind yet.
 
 ## Phase 8 — Compatibility and performance
 
