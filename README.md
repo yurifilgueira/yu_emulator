@@ -48,9 +48,11 @@ cargo run --release -p psx-harness -- suite bios/your-bios.bin tests/ps1-tests
 
 # open a window (Tab: display / whole VRAM, Esc: quit)
 cargo run --release -p frontend -- bios/your-bios.bin [program.exe]
+# start in a menu of the disc images found in a folder
+cargo run --release -p frontend -- bios/your-bios.bin --games path/to/games
 ```
 
-`cargo test` runs 335 unit tests and needs no BIOS. The test programs are not
+`cargo test` runs 354 unit tests and needs no BIOS. The test programs are not
 in the repository: unpack the [ps1-tests](https://github.com/JaCzekanski/ps1-tests/releases)
 release into `tests/ps1-tests/` and amidog's CPU tests into `tests/amidog/`
 (both gitignored). Currently 16 of the 32 ps1-tests programs that have a
@@ -59,7 +61,11 @@ phases.
 
 In the window the keyboard is a digital pad (arrows, Enter = START,
 Backspace = SELECT, Z/X/A/S = cross/circle/square/triangle, Q/W/1/2 =
-shoulders) and `--card file.mcd` plugs in a memory card. It runs at about a
+shoulders) and `--card file.mcd` plugs in a memory card. A connected game
+controller plays the same pad (buttons by position, left stick as d-pad).
+With `--games folder` the window starts in a menu listing the `.cue` sheets
+(or lone `.bin` images) found there, driven by the same pad buttons; F1, the
+controller's guide button or both stick clicks together go back to it. It runs at about a
 third of real time; speed is a later phase. Headless, `--press start@200`
 holds a button from a given video frame, which is how test programs with
 menus are driven.
