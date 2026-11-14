@@ -70,6 +70,8 @@ pub struct State {
     pub buttons: u16,
     /// The guide button or the menu combination.
     pub menu: bool,
+    /// Controllers connected.
+    pub connected: usize,
 }
 
 /// The connected controllers. Without controller support on the machine
@@ -92,6 +94,7 @@ impl Gamepads {
         while gilrs.next_event().is_some() {}
         let mut state = State::default();
         for (_, pad) in gilrs.gamepads() {
+            state.connected += 1;
             state.buttons |= pad_buttons(|button| pad.is_pressed(button));
             state.buttons |= stick_buttons(pad.value(Axis::LeftStickX), pad.value(Axis::LeftStickY));
             state.menu |= pad.is_pressed(Button::Mode);
