@@ -17,6 +17,101 @@ Model: claude-fable-5-2 · Session time: Xh · Human interventions: N
 
 ---
 
+## 2026-11-14 — Frontend: the menu redrawn with egui + wgpu
+
+Model: claude-fable-5-2 · Session time: ~1h30 (estimate, not measured) · Human interventions: 1
+
+- Done (branch `frontend-egui-menu`, on top of `frontend-game-menu`, pull request):
+  - The owner gave two mockups (library, folder without games) and a
+    specification (palette, fonts, measures, selection style) and asked
+    for the menu in egui + wgpu, in a 1024x768 window. Frontend only.
+  - The window is now `eframe` 0.37 with the wgpu renderer; `minifb` and
+    `font8x8` are gone. The console's picture is a texture drawn with
+    nearest-neighbour scaling, proportions kept as before.
+  - `frontend/src/ui/theme.rs`: the palette, the measures and the
+    embedded fonts (Inter Regular/Medium/SemiBold, JetBrains Mono).
+    `ui/icons.rs`: icons drawn with the painter. `ui/view.rs`: the two
+    screens, painted at the mockup's positions. `ui/menu.rs`: the
+    navigation state (the old `menu.rs`, plus the two buttons of the
+    empty screen and the details toggle).
+  - `frontend/src/library.rs`: the scan, now with each game's format,
+    size (the files a cue sheet names) and region, read from the licence
+    string in the disc's system area.
+  - `frontend/src/config.rs`: the folder picked in the menu is saved in
+    the user's configuration folder and used on the next run.
+  - Behaviour changes: with nothing named to run the window opens in the
+    menu (`--no-menu` gives the old "BIOS shell at once"); F1 always
+    goes to the menu; mouse clicks work; circle hides/shows the details
+    panel; the menu text is Portuguese, as in the mockups.
+  - Pacing: `minifb` capped the window at 60 updates a second. eframe
+    follows the display, so a `Pacer` runs one emulated frame (or menu
+    update) per sixtieth of a second whatever the refresh rate.
+  - 370 unit tests (313 core, 12 harness, 45 frontend).
+- Verified:
+  - Unit tests for the scan, metadata, saved folder, navigation, pacing
+    and picture placement. Four tests draw the menu with wgpu through
+    `egui_kittest` at 1024x768 and check colours at the mockup's
+    positions (bars, panel, selected row and its contour, tiles, buttons,
+    message); they print a note and skip the checks without a graphics
+    adapter. `YU_UI_SHOTS=<dir>` saves those pictures; I compared them
+    with the mockups by eye.
+  - The real window, through X11 with `--frames`: the menu on the test
+    folder (one game, region and size read from the disc) and the Sony
+    BIOS shell were captured with a temporary screenshot hook (not
+    committed) and looked right.
+- **Not verified:** nobody was at the machine. Under Wayland the session's
+  compositor gave the (covered) window no frames, so the Wayland path
+  never drew here. The folder and file dialogs (`rfd`, XDG portal) were
+  never opened. No controller was connected, so the "Controle · Porta 1"
+  chip was only drawn in tests. Mouse clicks are tested on a list row
+  only. Sound with the new pacing was not listened to.
+- Tests that changed, and why:
+  - `long_titles_are_cut`, `render_highlights_the_selected_row` and
+    `render_explains_an_empty_list_and_shows_messages` tested the
+    software renderer that no longer exists (character counts, pixels of
+    the 320x240 picture). They are replaced by the rendered tests above,
+    which check the same things (selected row, text present, message)
+    on the new drawing; long titles are now cut by egui's text layout
+    and that is not tested.
+  - `keys_map_to_pad_buttons`, `pictures_use_the_window_pixel_format`:
+    same assertions, on egui's key and image types.
+  - Navigation tests: same assertions; `update` returns an `Action`
+    wrapping the old `Choice`, and the row count is set by the view
+    (the tests set the old 12).
+- Broke / surprised us:
+  - egui 0.37 differs from what I knew (`App::logic`/`App::ui`, `Sense`
+    flags, `scope_id`); I read the crate sources instead of guessing.
+  - `--frames` never ended: eframe runs no UI pass for a hidden window,
+    and the count is of UI passes. Found because the smoke run hung
+    with 0.3% CPU. With `--frames` the app now asks to paint while
+    hidden. Under Wayland a covered window still gets no frames.
+  - My first pacer ran two frames after a stall (it resynchronised to
+    "now" instead of "now + one tick"); its own test caught it.
+  - A rendered test sampled the scroll bar instead of the gap next to
+    it; the coordinate was wrong, not the drawing.
+- Deviations from the mockup, for the owner to judge:
+  - A "Sem disco" entry (the BIOS shell) ends the list, as in the old
+    menu; with eight games it is the ninth entry and needs scrolling.
+  - The empty screen names `.cue, .bin, .iso, .img`; the mockup says
+    `.chd`, which the core cannot read.
+  - A red-ish colour (#FF8A80) for error messages, not in the palette.
+  - The focused "Escolher pasta" button is already the accent colour,
+    so its selection contour is drawn around it in the text colour.
+  - "Ordem: nome" is a label; there is no other order.
+  - The folder can only be changed with the mouse (click on its path),
+    since the system's dialog cannot be driven with a controller.
+- Known limits: file names with characters Inter lacks (Japanese, for
+  one) show empty boxes, because only the embedded fonts are loaded; the
+  system dialogs block the window while open; a 4:3 correction of the
+  console's picture is still not applied.
+- New dependencies: `eframe` 0.37 (wgpu, x11, wayland), `rfd` 0.18;
+  for tests `egui_kittest` and `image`. Four font files (about 1.5 MB,
+  SIL Open Font License, licences next to them) are committed in
+  `frontend/assets/fonts`.
+- Human stepped in for: the mockups and the specification.
+- Next: owner tries the window (Wayland, dialogs, a controller, sound)
+  and judges the deviations; then Phase 8.
+
 ## 2026-11-12 — Frontend: game menu and controllers
 
 Model: claude-fable-5-2 · Session time: ~1h (estimate, not measured) · Human interventions: 1

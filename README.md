@@ -46,13 +46,18 @@ cargo run --release -p psx-harness -- vram-hash bios/your-bios.bin tests/ps1-tes
 # run every test program that ships with a console log or VRAM image
 cargo run --release -p psx-harness -- suite bios/your-bios.bin tests/ps1-tests
 
-# open a window (Tab: display / whole VRAM, Esc: quit)
-cargo run --release -p frontend -- bios/your-bios.bin [program.exe]
-# start in a menu of the disc images found in a folder
+# open a window in the game menu (Esc: quit)
+cargo run --release -p frontend -- bios/your-bios.bin
+# the menu lists the disc images found in this folder
 cargo run --release -p frontend -- bios/your-bios.bin --games path/to/games
+# run a program, a disc or the BIOS shell directly (Tab: display / whole VRAM)
+cargo run --release -p frontend -- bios/your-bios.bin program.exe
+cargo run --release -p frontend -- bios/your-bios.bin --disc game.cue
+cargo run --release -p frontend -- bios/your-bios.bin --no-menu
 ```
 
-`cargo test` runs 354 unit tests and needs no BIOS. The test programs are not
+`cargo test` runs 370 unit tests and needs no BIOS (four of them draw the
+menu with wgpu and skip their checks on a machine without a graphics adapter). The test programs are not
 in the repository: unpack the [ps1-tests](https://github.com/JaCzekanski/ps1-tests/releases)
 release into `tests/ps1-tests/` and amidog's CPU tests into `tests/amidog/`
 (both gitignored). Currently 16 of the 32 ps1-tests programs that have a
@@ -63,9 +68,14 @@ In the window the keyboard is a digital pad (arrows, Enter = START,
 Backspace = SELECT, Z/X/A/S = cross/circle/square/triangle, Q/W/1/2 =
 shoulders) and `--card file.mcd` plugs in a memory card. A connected game
 controller plays the same pad (buttons by position, left stick as d-pad).
-With `--games folder` the window starts in a menu listing the `.cue` sheets
-(or lone `.bin` images) found there, driven by the same pad buttons; F1, the
-controller's guide button or both stick clicks together go back to it. It runs at about a
+With nothing named to run the window starts in a menu (egui on wgpu, in
+Portuguese) listing the `.cue` sheets (or lone `.bin`/`.iso`/`.img` images)
+of the games folder: the one given with `--games`, or the one picked in the
+menu, which is remembered. It is driven by the same pad buttons or the
+mouse; F1, the controller's guide button or both stick clicks together go
+back to it. On Linux the folder and file dialogs need an XDG desktop portal
+(any current desktop has one). The menu's fonts, Inter and JetBrains Mono,
+are embedded (SIL Open Font License, see `frontend/assets/fonts`). It runs at about a
 third of real time; speed is a later phase. Headless, `--press start@200`
 holds a button from a given video frame, which is how test programs with
 menus are driven.
