@@ -17,6 +17,45 @@ Model: claude-fable-5-2 · Session time: Xh · Human interventions: N
 
 ---
 
+## 2026-11-12 — Frontend: game menu and controllers
+
+Model: claude-fable-5-2 · Session time: ~1h (estimate, not measured) · Human interventions: 1
+
+- Done (branch `frontend-game-menu`, on top of `phase-7-spu`, pull request):
+  - The owner asked for a game selection menu before Phase 8, usable with
+    a controller. Not a roadmap item; frontend only, the core is untouched.
+  - `frontend/src/menu.rs`: `--games DIR` scans a folder (four levels
+    deep) for `.cue` sheets, or lone `.bin`/`.iso`/`.img` images in
+    folders without a sheet, and shows them in a 320x240 list with a
+    "No disc (BIOS)" entry. Driven by the pad button mask, so keyboard
+    and controller work alike. A disc that fails to load leaves the menu
+    up with the error.
+  - `frontend/src/input.rs`: controllers through `gilrs`; every
+    controller plays port 1 together with the keyboard; the left stick
+    doubles as the d-pad. F1, the guide button or L3+R3 go back to the
+    menu (the memory card is saved first).
+  - `frontend/src/font.rs`: text with the public-domain `font8x8` glyphs.
+  - 354 unit tests (313 core, 12 harness, 29 frontend).
+- Verified: unit tests for the scan, navigation, key repeat, scrolling,
+  rendering and the button mappings; the menu picture rendered to a file
+  and looked at.
+- **Not verified:** the machine this ran on has no display for the
+  session and no controller, so the window with the menu was never
+  opened and no controller button was ever read. The `gilrs` polling
+  code (`Gamepads::poll`) is untested; only the pure mapping functions
+  are. The owner has to try both.
+- Broke / surprised us:
+  - A test of mine re-bound a variable above an older assertion, which
+    then failed; I moved my lines, the older assertion is unchanged.
+- Known limits: L3+R3 is also sent to the game before the menu opens;
+  one memory card file for all games (`--card`), not one per game; going
+  back to the menu drops the running game without asking; no analog pad;
+  the menu text is English only; titles are file names.
+- New dependencies: `gilrs` 0.11 (needs libudev on Linux) and `font8x8`
+  0.3. The owner may prefer others.
+- Human stepped in for: asking for the menu and controller support.
+- Next: owner tries the menu and a controller; then Phase 8.
+
 ## 2026-11-12 — Phase 7 (second part): SPU and CD sound
 
 Model: claude-fable-5-2 · Session time: ~3h (estimate, not measured) · Human interventions: 0
